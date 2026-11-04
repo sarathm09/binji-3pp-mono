@@ -123,7 +123,7 @@ link_dylib() {
   "$(xcrun --sdk "$sdk" --find clang)" -dynamiclib -target "$triple" -isysroot "$sdk_path" \
     -install_name "$(install_name "$fw")" \
     -compatibility_version 1 -current_version "$version" \
-    -Wl,-all_load "$work/prefix/lib/lib$name.a" ${extra[@]+"${extra[@]}"} \
+    -Wl,-all_load "$work/prefix/lib/lib${name#lib}.a" ${extra[@]+"${extra[@]}"} \
     -Wl,-dead_strip_dylibs -Wl,-headerpad_max_install_names \
     -o "$work/link/$fw.framework/$fw"
   "$(xcrun --sdk "$sdk" --find strip)" -x "$work/link/$fw.framework/$fw"
