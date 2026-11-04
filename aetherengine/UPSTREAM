@@ -1,0 +1,5 @@
+repository: https://github.com/superuser404notfound/AetherEngine
+tag: 7.54.0
+commit: ee5027c69a27aae97ed852ded0d1151d5d225c34
+synced: 2026-11-04T03:24:49Z
+binaries: not mirrored; prebuilt frameworks ship from the upstream tag above

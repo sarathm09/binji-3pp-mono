@@ -1,0 +1,1637 @@
+#!/bin/zsh
+#
+# FFmpegBuild: Minimal FFmpeg cross-compilation for Apple platforms.
+# Includes dav1d (fast AV1 software decoder).
+#
+# Usage:
+#   ./build.sh          # Build all platforms as dynamic frameworks (the shipped shape)
+#   ./build.sh static   # Build static variant (not App Store friendly for closed-source apps)
+#   ./build.sh package  # Repackage frameworks from existing build products
+#   ./build.sh clean    # Remove all build artifacts
+#
+set -eo pipefail  # pipefail so `... | tail -N` doesn't swallow configure/make errors
+
+FFMPEG_VERSION="n8.1.3"
+FFMPEG_REPO="https://github.com/FFmpeg/FFmpeg.git"
+DAV1D_VERSION="1.5.4"
+DAV1D_REPO="https://code.videolan.org/videolan/dav1d.git"
+ZIMG_VERSION="release-3.0.6"
+ZIMG_REPO="https://github.com/sekrit-twc/zimg.git"
+ZVBI_VERSION="v0.2.46"
+ZVBI_REPO="https://github.com/zapping-vbi/zvbi.git"
+# Debug info for crash symbolication. `-gline-tables-only` carries function
+# names, file/line and inlined frames, which is everything a symbolicated crash
+# report needs, and leaves out the type information that makes up the bulk of
+# full `-g` DWARF (measured on tvos-arm64: 11 MB of dSYM for all nine libraries
+# against roughly four times that for -g). It changes no generated code; the
+# shipped binaries are still stripped in make_framework, the debug info is
+# harvested into dSYMs beforehand.
+DEBUG_CFLAG="-gline-tables-only"
+SCRIPT_DIR="${0:a:h}"
+BUILD_DIR="${SCRIPT_DIR}/build"
+OUTPUT_DIR="${SCRIPT_DIR}/Sources"
+FFMPEG_SRC="${BUILD_DIR}/ffmpeg-src"
+DAV1D_SRC="${BUILD_DIR}/dav1d-src"
+ZIMG_SRC="${BUILD_DIR}/zimg-src"
+ZVBI_SRC="${BUILD_DIR}/zvbi-src"
+
+# Dynamic (dylib-in-framework) is the shipped shape: LGPL requires that end
+# users can swap the FFmpeg libraries, which embedded dynamic frameworks
+# permit and a statically linked closed-source binary does not. Static stays
+# available for people who build themselves and can meet LGPL 6(a) instead.
+MODE="build"
+LINKAGE="dynamic"
+for ARG in "$@"; do
+    case "${ARG}" in
+        clean)   MODE="clean" ;;
+        package) MODE="package" ;;
+        static)  LINKAGE="static" ;;
+        dynamic) LINKAGE="dynamic" ;;
+        *) echo "Unknown argument: ${ARG}"; exit 1 ;;
+    esac
+done
+
+if [[ "${LINKAGE}" == "static" ]]; then
+    CONFIGURE_LINK_FLAGS=(--enable-static --disable-shared)
+    MESON_LIBRARY="static"
+else
+    CONFIGURE_LINK_FLAGS=(--disable-static --enable-shared)
+    MESON_LIBRARY="shared"
+fi
+
+# ─────────────────────────────────────────────────────────
+
+discard_stale_source() {
+    # The fetch functions below skip the clone when the source directory already exists, so
+    # bumping a version string alone would rebuild the OLD source and produce a release that
+    # changed nothing. Drop a tree whose checked-out tag is not the one asked for and let the
+    # caller re-clone. Verified against the shallow `--depth 1 --branch <tag>` clones these
+    # functions create: `describe --tags --exact-match` returns the tag on each of them.
+    local dir="$1" want="$2" have
+    [[ -d "${dir}" ]] || return 0
+    have="$(git -C "${dir}" describe --tags --exact-match 2>/dev/null)"
+    if [[ "${have}" != "${want}" ]]; then
+        echo "→ ${dir:t} is at '${have:-unknown}', want '${want}': discarding and re-cloning"
+        rm -rf "${dir}"
+    fi
+}
+
+fetch_ffmpeg() {
+    discard_stale_source "${FFMPEG_SRC}" "${FFMPEG_VERSION}"
+    if [[ -d "${FFMPEG_SRC}" ]]; then
+        echo "→ FFmpeg source already exists, skipping clone"
+        return
+    fi
+    echo "→ Cloning FFmpeg ${FFMPEG_VERSION}..."
+    git clone --depth 1 --branch "${FFMPEG_VERSION}" "${FFMPEG_REPO}" "${FFMPEG_SRC}"
+}
+
+patch_ffmpeg() {
+    # Upstream bug in vf_yadif_videotoolbox.m (present through n8.1.2): call_kernel gets
+    # commandBuffer / computeCommandEncoder from property getters, which return AUTORELEASED
+    # (+0) objects under FFmpeg's non-ARC ObjC build, then releases them manually via
+    # ff_objc_release, an over-release. (The s->mtl* releases in uninit ARE correct: those are
+    # +1 objects from newCommandQueue/newLibrary etc.) ffmpeg's CLI never pops a pool on its
+    # filter threads so it goes unnoticed; a host app's GCD queues pop their last-resort pool
+    # when the work block ends, crashing at session teardown (EXC_BAD_ACCESS in
+    # AutoreleasePoolPage::releaseUntil). Fix: wrap the kernel call in @autoreleasepool and drop
+    # the manual releases, so the pool pop is the single balanced release and Metal transients
+    # drain per frame.
+    local F="${FFMPEG_SRC}/libavfilter/vf_yadif_videotoolbox.m"
+    grep -q "@autoreleasepool" "${F}" && return
+    echo "→ Patching FFmpeg: balance autoreleased Metal objects in yadif_videotoolbox"
+    perl -0777 -pi -e '
+s#\{\n    YADIFVTContext \*s = ctx->priv;\n    id<MTLCommandBuffer> buffer#{\n    YADIFVTContext *s = ctx->priv;\n    \@autoreleasepool {\n    id<MTLCommandBuffer> buffer#;
+s#    ff_objc_release\(&encoder\);\n    ff_objc_release\(&buffer\);\n\}#    } // \@autoreleasepool: buffer + encoder are +0 autoreleased by their getters.\n      // Upstream released them manually here (over-release); the pool pop above\n      // is the single balanced release. See FFmpegBuild build.sh patch_ffmpeg.\n}#;
+' "${F}"
+    if ! grep -q "@autoreleasepool" "${F}"; then
+        echo "ERROR: yadif_videotoolbox autorelease patch did not apply (upstream source changed?)"
+        exit 1
+    fi
+}
+
+patch_ffmpeg_pgssub() {
+    # AetherEngine #142, second shape (FFmpeg PR 23851). PGS carries no end time,
+    # a cue is closed by the start of its successor, so dropping a damaged display
+    # set also removes the successor that would have closed the previous cue: the
+    # predecessor overstays its authored end until the next intact set arrives.
+    # Outside AV_EF_EXPLODE, emit the empty subtitle instead. The pts is already
+    # set and no rect has been allocated yet, so this is the same clearing form
+    # the object_count == 0 path a few lines above returns.
+    #
+    # The first version of this patch instead kept the palette/object cache across
+    # composition state 3 (Epoch Continue). That was withdrawn: the caches are
+    # fixed arrays bounded by a COUNT (MAX_EPOCH_OBJECTS 64), and retained
+    # pre-connection objects occupy the slots a self-contained connection set needs,
+    # so a conformant set conveying a new object id is rejected with "Too many
+    # objects in epoch" although stock FFmpeg renders it. What we actually needed
+    # was the recovery below, and it covers every damaged set, not only Epoch
+    # Continue.
+    local F="${FFMPEG_SRC}/libavcodec/pgssubdec.c"
+    grep -q "pgs-missing-palette" "${F}" && return
+    echo "→ Patching FFmpeg: close the predecessor cue on a missing pgssub palette (AetherEngine #142)"
+    perl -0777 -pi -e '
+s#               ctx->presentation\.palette_id\);\n        avsubtitle_free\(sub\);\n        return AVERROR_INVALIDDATA;\n    \}#               ctx->presentation.palette_id);\n        /* pgs-missing-palette: dropping the set here would also drop the successor\n         * that closes the previous cue, so the predecessor overstays its authored\n         * end. Outside AV_EF_EXPLODE emit the empty subtitle instead: the pts is\n         * set, no rect is allocated yet, and this is the clearing form the\n         * object_count == 0 path above returns.\n         * See FFmpegBuild build.sh patch_ffmpeg_pgssub (AetherEngine issue 142,\n         * FFmpeg PR 23851). */\n        if (avctx->err_recognition \& AV_EF_EXPLODE) {\n            avsubtitle_free(sub);\n            return AVERROR_INVALIDDATA;\n        }\n        av_freep(\&sub->rects);\n        return 1;\n    }#;
+' "${F}"
+    if ! grep -q "pgs-missing-palette" "${F}"; then
+        echo "ERROR: pgssubdec missing-palette patch did not apply (upstream source changed?)"
+        exit 1
+    fi
+}
+
+patch_ffmpeg_vc1_parser() {
+    # AetherEngine #490 (FFmpeg PR 24458). libavformat closes and reopens the parser on
+    # every reposition (ff_read_frame_flush), and vc1_parser.c never seeds its VC1Context
+    # from avctx->extradata the way vc1_decode_init does. So after a seek the context has
+    # profile 0 and max_coded_width/height 0 until an in-stream sequence header happens to
+    # pass, and an entry point landing there is read at the wrong bit offset: hrd_full[]
+    # precedes coded_size_flag only when the sequence header set hrd_param_flag, which a
+    # zeroed context cannot know. The bit taken for coded_size_flag is then the top bit of
+    # hrd_full[0], the leaky bucket fullness at that entry point, so a bucket below half
+    # full falls back to the zero pair ("Picture size 0x0 is invalid") and one above half
+    # takes a coded size out of the following payload, silently. The same context also
+    # sends an advanced profile frame header through the simple/main reader, so pict_type
+    # and repeat_pict, which libavformat turns into the packet key flag and the packet
+    # duration, come out of the wrong reader after every seek.
+    local F="${FFMPEG_SRC}/libavcodec/vc1_parser.c"
+    grep -q "vc1_parse_extradata" "${F}" && return
+    echo "→ Patching FFmpeg: seed the VC-1 parse context from extradata (AetherEngine #490)"
+    local SEED
+    SEED=$(cat <<'VC1SEEDEOF'
+/**
+ * Seed the parse context from extradata, the way the decoder does at init.
+ *
+ * libavformat closes and reopens the parser on every reposition
+ * (ff_read_frame_flush()), so each seek starts from a zeroed VC1Context: profile
+ * reads as simple, and max_coded_width/max_coded_height as zero, until an
+ * in-stream sequence header happens to pass. An entry point reaching a context in
+ * that state is read at the wrong bit offset, because whether hrd_full[] precedes
+ * coded_size_flag is a property of the sequence header, and the size it then
+ * falls back to is the zero pair.
+ */
+static void vc1_parse_extradata(AVCodecParserContext *s, AVCodecContext *avctx)
+{
+    VC1ParseContext *vpc = s->priv_data;
+    const uint8_t *start, *end, *next;
+    uint8_t *buf2;
+    GetBitContext gb;
+
+    if (!avctx->extradata || avctx->extradata_size < 16)
+        return;
+
+    buf2 = av_mallocz(avctx->extradata_size + AV_INPUT_BUFFER_PADDING_SIZE);
+    if (!buf2)
+        return;
+
+    vpc->v.s.avctx = avctx;
+    end   = avctx->extradata + avctx->extradata_size;
+    start = find_next_marker(avctx->extradata, end);
+    for (next = start; next < end; start = next) {
+        int size, buf2_size;
+
+        next = find_next_marker(start + 4, end);
+        size = next - start - 4;
+        if (size <= 0)
+            continue;
+        buf2_size = vpc->v.vc1dsp.vc1_unescape_buffer(start + 4, size, buf2);
+        if (init_get_bits8(&gb, buf2, buf2_size) < 0)
+            break;
+        switch (AV_RB32(start)) {
+        case VC1_CODE_SEQHDR:
+            if (ff_vc1_decode_sequence_header(avctx, &vpc->v, &gb) < 0)
+                goto done;
+            break;
+        case VC1_CODE_ENTRYPOINT:
+            if (ff_vc1_decode_entry_point(avctx, &vpc->v, &gb) < 0)
+                goto done;
+            break;
+        }
+    }
+
+done:
+    av_free(buf2);
+}
+
+VC1SEEDEOF
+)
+    VC1_SEED="${SEED}" perl -0777 -pi -e '
+s!\Q#include "libavutil/avassert.h"\E!#include "libavutil/avassert.h"\n#include "libavutil/mem.h"!;
+s!\Q    uint8_t prev_start_code;\E!    uint8_t prev_start_code;\n    uint8_t extradata_parsed;!;
+s!\Qstatic int vc1_parse(AVCodecParserContext *s,\E!$ENV{VC1_SEED} . qq{\n\n} . q{static int vc1_parse(AVCodecParserContext *s,}!e;
+s#\Q    int i = vpc->bytes_to_skip;\E\n#    int i = vpc->bytes_to_skip;\n\n    if (!vpc->extradata_parsed) {\n        vpc->extradata_parsed = 1;\n        vc1_parse_extradata(s, avctx);\n    }\n#;
+s!\Q    vpc->prev_start_code = 0;\E!    vpc->prev_start_code = 0;\n    vpc->extradata_parsed = 0;!;
+' "${F}"
+    if ! grep -q "vc1_parse_extradata" "${F}"; then
+        echo "ERROR: vc1_parser extradata seeding patch did not apply (upstream source changed?)"
+        exit 1
+    fi
+}
+
+patch_ffmpeg_visionos() {
+    # visionOS has no OpenGL and no OpenGL ES, so kCVPixelBufferOpenGLESCompatibilityKey
+    # is marked unavailable there. Upstream picks that key on TARGET_OS_IPHONE, which is 1
+    # on visionOS (TARGET_OS_IOS is the one that is 0), so the hardware-decode path fails
+    # to compile for xros with "'kCVPixelBufferOpenGLESCompatibilityKey' is unavailable".
+    # Nothing is lost by omitting it: the attribute only asks CoreVideo to make the buffer
+    # bindable as a GL texture, and on visionOS every consumer is Metal, which the
+    # IOSurface backing set just above already covers. TARGET_OS_VISION is defined as 0 on
+    # SDKs that predate it, and an undefined macro evaluates to 0 in #if, so this is safe
+    # on every other slice.
+    local F="${FFMPEG_SRC}/libavcodec/videotoolbox.c"
+    grep -q "TARGET_OS_VISION" "${F}" && return
+    echo "→ Patching FFmpeg: skip the OpenGL ES buffer attribute on visionOS"
+    perl -0777 -pi -e '
+s@\#if TARGET_OS_IPHONE\n    CFDictionarySetValue\(buffer_attributes, kCVPixelBufferOpenGLESCompatibilityKey, kCFBooleanTrue\);\n\#else@\#if TARGET_OS_VISION\n    /* visionOS has neither OpenGL ES nor OpenGL, and the key is unavailable there.\n     * Consumers are Metal, which the IOSurface properties above already cover.\n     * See FFmpegBuild build.sh patch_ffmpeg_visionos. */\n\#elif TARGET_OS_IPHONE\n    CFDictionarySetValue(buffer_attributes, kCVPixelBufferOpenGLESCompatibilityKey, kCFBooleanTrue);\n\#else@;
+' "${F}"
+    if ! grep -q "TARGET_OS_VISION" "${F}"; then
+        echo "ERROR: visionOS videotoolbox patch did not apply (upstream source changed?)"
+        exit 1
+    fi
+}
+
+patch_ffmpeg_matroska_tts() {
+    # AetherEngine #145, reworked after upstream review (FFmpeg PR 23852):
+    # RFC 9559 (11.1.3, 11.2, 5.1.3.5.3) puts Block/SimpleBlock relative
+    # timestamps and BlockDuration in Track Ticks, so absolute time is
+    # (cluster + rel x TTS) x TimestampScale, and upstream matroskadec
+    # implements exactly that. The earlier clamp here (any TTS != 1 forced to
+    # 1.0) rested on a wrong reading of the RFC and would mistime a conformant
+    # TTS != 1 file; the file that motivated it was authored on the segment
+    # axis (invalid per RFC). What remains worth carrying: TTS != 1 is
+    # deprecated (maxver 3), many readers ignore it, and a file carrying it may
+    # have been authored against such readers. Emit a warning next to
+    # upstream's own "< 0.01" guard so the condition is visible; timestamp
+    # behavior stays RFC.
+    local F="${FFMPEG_SRC}/libavformat/matroskadec.c"
+    grep -q "AetherEngine issue 145" "${F}" && return
+    echo "→ Patching FFmpeg: warn on matroska TrackTimestampScale != 1 (AetherEngine #145)"
+    perl -0777 -pi -e '
+s#        if \(track->time_scale < 0\.01\) \{\n            av_log\(matroska->ctx, AV_LOG_WARNING,\n                   "Track TimestampScale too small %f, assuming 1\.0\.\\n",\n                   track->time_scale\);\n            track->time_scale = 1\.0;\n        \}#        if (track->time_scale < 0.01) {\n            av_log(matroska->ctx, AV_LOG_WARNING,\n                   "Track TimestampScale too small %f, assuming 1.0.\\n",\n                   track->time_scale);\n            track->time_scale = 1.0;\n        } else if (track->time_scale != 1.0) {\n            /* Applied per RFC 9559: block timestamps and BlockDuration are\n             * Track Ticks, scaled against the segment axis. The element is\n             * deprecated (maxver 3) and many readers ignore it, so a file\n             * carrying it may have been authored against such readers; surface\n             * it instead of staying silent. See FFmpegBuild build.sh\n             * patch_ffmpeg_matroska_tts (AetherEngine issue 145). */\n            av_log(matroska->ctx, AV_LOG_WARNING,\n                   "TrackTimestampScale %f applied per RFC 9559; many readers "\n                   "ignore this element and files may be authored against them.\\n",\n                   track->time_scale);\n        }#;
+' "${F}"
+    if ! grep -q "AetherEngine issue 145" "${F}"; then
+        echo "ERROR: matroska TrackTimestampScale patch did not apply (upstream source changed?)"
+        exit 1
+    fi
+}
+
+patch_ffmpeg_dav1_tag() {
+    # AetherEngine #547. MP4RA registers 'dav1' as the AV1 sample entry that signals
+    # Dolby Vision, and Apple's HLS authoring spec requires it for Dolby Vision
+    # Profile 10.0, the AV1 analogue of HEVC Profile 5: an IPT-PQ-c2 signal with no
+    # compatible base layer, so 'av01' is not an alternative there. FFmpeg knows the
+    # tag in neither direction (checked against master, 2026-09-18). Two tables, and
+    # both are needed: isom_tags.c maps the sample entry back to a codec id, so
+    # without it a 'dav1' MP4 probes as "unknown codec"; movenc.c's codec_mp4_tags is
+    # what validate_codec_tag() checks a requested tag against, so without it
+    # avformat_write_header fails with EINVAL and our remux never starts. 'dvh1' sits
+    # in that second table for the HEVC side already, which is why Profile 5 works.
+    # The cross-compatible profiles (10.1 / 10.4) ride an 'av01' sample entry with
+    # SUPPLEMENTAL-CODECS and are unaffected.
+    # Upstream as 4c6d67fe0f (PR 24556, merged 2026-09-18), master only, no release/8.1
+    # backport. The early return below makes this a no-op once FFMPEG_VERSION carries
+    # it, so drop this function on the FFmpeg 9.x bump.
+    local T="${FFMPEG_SRC}/libavformat/isom_tags.c"
+    local M="${FFMPEG_SRC}/libavformat/movenc.c"
+    if grep -q "'d', 'a', 'v', '1'" "${T}" && grep -q "'d', 'a', 'v', '1'" "${M}"; then
+        return
+    fi
+    echo "→ Patching FFmpeg: accept the dav1 sample entry for AV1 Dolby Vision (AetherEngine #547)"
+    perl -0777 -pi -e '
+s#(\{ AV_CODEC_ID_AV1,  MKTAG\('"'"'a'"'"', '"'"'v'"'"', '"'"'0'"'"', '"'"'1'"'"'\) \}, /\* AV1 \*/\n)#$1    { AV_CODEC_ID_AV1,  MKTAG('"'"'d'"'"', '"'"'a'"'"', '"'"'v'"'"', '"'"'1'"'"') }, /* AV1-related Dolby Vision */\n#;
+' "${T}"
+    perl -0777 -pi -e '
+s#(\{ AV_CODEC_ID_AV1,             MKTAG\('"'"'a'"'"', '"'"'v'"'"', '"'"'0'"'"', '"'"'1'"'"'\) \},\n)#$1    { AV_CODEC_ID_AV1,             MKTAG('"'"'d'"'"', '"'"'a'"'"', '"'"'v'"'"', '"'"'1'"'"') },\n#;
+' "${M}"
+    if ! grep -q "'d', 'a', 'v', '1'" "${T}" || ! grep -q "'d', 'a', 'v', '1'" "${M}"; then
+        echo "ERROR: dav1 codec tag patch did not apply (upstream source changed?)"
+        exit 1
+    fi
+}
+
+fetch_dav1d() {
+    discard_stale_source "${DAV1D_SRC}" "${DAV1D_VERSION}"
+    if [[ -d "${DAV1D_SRC}" ]]; then
+        echo "→ dav1d source already exists, skipping clone"
+        return
+    fi
+    echo "→ Cloning dav1d ${DAV1D_VERSION}..."
+    git clone --depth 1 --branch "${DAV1D_VERSION}" "${DAV1D_REPO}" "${DAV1D_SRC}"
+}
+
+fetch_zimg() {
+    discard_stale_source "${ZIMG_SRC}" "${ZIMG_VERSION}"
+    if [[ -d "${ZIMG_SRC}" ]]; then
+        echo "→ zimg source already exists, skipping clone"
+        return
+    fi
+    echo "→ Cloning zimg ${ZIMG_VERSION}..."
+    git clone --depth 1 --branch "${ZIMG_VERSION}" --recurse-submodules "${ZIMG_REPO}" "${ZIMG_SRC}"
+    # zimg ships an autotools build; generate the configure script once.
+    # macOS Homebrew installs GNU libtool as glibtoolize; this gnubin dir
+    # exposes it (and friends) under their normal names so autogen.sh's
+    # libtoolize call resolves.
+    ( cd "${ZIMG_SRC}" && PATH="/opt/homebrew/opt/libtool/libexec/gnubin:${PATH}" ./autogen.sh )
+}
+
+fetch_zvbi() {
+    discard_stale_source "${ZVBI_SRC}" "${ZVBI_VERSION}"
+    if [[ -d "${ZVBI_SRC}" ]]; then
+        echo "→ zvbi source already exists, skipping clone"
+        return
+    fi
+    echo "→ Cloning zvbi ${ZVBI_VERSION}..."
+    git clone --depth 1 --branch "${ZVBI_VERSION}" "${ZVBI_REPO}" "${ZVBI_SRC}"
+    # libzvbi ships autotools sources without a generated configure; bootstrap once.
+    # gettext's autopoint and Homebrew's GNU libtool (as glibtoolize) must be on PATH.
+    ( cd "${ZVBI_SRC}" && PATH="/opt/homebrew/opt/libtool/libexec/gnubin:/opt/homebrew/opt/gettext/bin:${PATH}" NOCONFIGURE=1 ./autogen.sh )
+}
+
+patch_zvbi() {
+    # License hygiene: zvbi's library sources are LGPL-2+/MIT EXCEPT
+    # packet-830.c + pdc.c (GPL-2) and exp-vtx.c (GPL-2+), see zvbi COPYING.md.
+    # GPL code must not ship in this LGPL build, so those files are dropped.
+    # packet.c calls two packet-830.c entry points behind the
+    # VBI_EVENT_LOCAL_TIME / VBI_EVENT_PROG_ID event masks, which no consumer
+    # of this build registers (FFmpeg's teletext decoder only registers
+    # VBI_EVENT_TTX_PAGE); LGPL stubs reporting decode failure close the link.
+    local MK="${ZVBI_SRC}/src/Makefile.am"
+    grep -q "packet-830-stub.c" "${MK}" && return
+
+    echo "→ Patching zvbi: dropping GPL sources (packet-830.c, pdc.c, exp-vtx.c)"
+    sed -i '' \
+        -e 's/packet-830\.c packet-830\.h \\/packet-830.h packet-830-stub.c \\/' \
+        -e 's/pdc\.c pdc\.h \\/pdc.h \\/' \
+        -e '/exp-vtx\.c \\/d' \
+        "${MK}"
+
+    cat > "${ZVBI_SRC}/src/packet-830-stub.c" << 'EOF'
+/*
+ *  libzvbi -- LGPL stubs for the GPL-2 packet-830.c entry points
+ *
+ *  FFmpegBuild removes the GPL-2 sources packet-830.c and pdc.c from the
+ *  library. packet.c references these two functions behind the
+ *  VBI_EVENT_LOCAL_TIME / VBI_EVENT_PROG_ID event masks; they report
+ *  decode failure so callers drop the packet.
+ *
+ *  Copyright (C) 2026 Vincent Herbst
+ *
+ *  This library is free software; you can redistribute it and/or
+ *  modify it under the terms of the GNU Library General Public
+ *  License as published by the Free Software Foundation; either
+ *  version 2 of the License, or (at your option) any later version.
+ */
+
+#include <time.h>
+#include <stdint.h>
+
+extern int
+vbi_decode_teletext_8301_local_time (time_t *time, int *seconds_east, const uint8_t *buffer);
+extern int
+vbi_decode_teletext_8302_pdc (void *pid, const uint8_t *buffer);
+
+int
+vbi_decode_teletext_8301_local_time (time_t *time, int *seconds_east, const uint8_t *buffer)
+{
+    (void) time;
+    (void) seconds_east;
+    (void) buffer;
+    return 0;
+}
+
+int
+vbi_decode_teletext_8302_pdc (void *pid, const uint8_t *buffer)
+{
+    (void) pid;
+    (void) buffer;
+    return 0;
+}
+EOF
+
+    # Makefile.am changed; regenerate the build system.
+    ( cd "${ZVBI_SRC}" && PATH="/opt/homebrew/opt/libtool/libexec/gnubin:/opt/homebrew/opt/gettext/bin:${PATH}" NOCONFIGURE=1 ./autogen.sh )
+}
+
+# ─────────────────────────────────────────────────────────
+# dav1d cross-compilation (Meson + Ninja)
+# ─────────────────────────────────────────────────────────
+
+build_dav1d_one() {
+    local KEY="$1" SDK="$2" ARCH="$3" TARGET="$4" MIN_VER="$5"
+
+    echo ""
+    echo "━━━ Building dav1d: ${KEY} (${ARCH} for ${SDK}) ━━━"
+
+    local SDK_PATH=$(xcrun --sdk "${SDK}" --show-sdk-path)
+    local INSTALL_DIR="${BUILD_DIR}/dav1d-thin/${KEY}"
+    local WORK_DIR="${BUILD_DIR}/dav1d-work/${KEY}"
+    rm -rf "${WORK_DIR}" "${INSTALL_DIR}"
+    mkdir -p "${WORK_DIR}" "${INSTALL_DIR}"
+
+    # Determine CPU family and system for Meson cross file
+    local CPU_FAMILY="aarch64"
+    local CPU="aarch64"
+    [[ "${ARCH}" == "x86_64" ]] && CPU_FAMILY="x86_64" && CPU="x86_64"
+
+    local SYSTEM="darwin"
+
+    # Create Meson cross file
+    cat > "${WORK_DIR}/cross.txt" << CROSSEOF
+[binaries]
+c = '/usr/bin/clang'
+ar = '/usr/bin/ar'
+strip = '/usr/bin/strip'
+
+[built-in options]
+c_args = ['-arch', '${ARCH}', '-isysroot', '${SDK_PATH}', '-target', '${TARGET}', '-fno-common', '${DEBUG_CFLAG}']
+c_link_args = ['-arch', '${ARCH}', '-isysroot', '${SDK_PATH}', '-target', '${TARGET}', '-Wl,-headerpad_max_install_names']
+
+[host_machine]
+system = '${SYSTEM}'
+cpu_family = '${CPU_FAMILY}'
+cpu = '${CPU}'
+endian = 'little'
+CROSSEOF
+
+    cd "${WORK_DIR}"
+
+    meson setup \
+        --cross-file "${WORK_DIR}/cross.txt" \
+        --prefix="${INSTALL_DIR}" \
+        --default-library="${MESON_LIBRARY}" \
+        --buildtype=release \
+        -Denable_tools=false \
+        -Denable_examples=false \
+        -Denable_tests=false \
+        "${DAV1D_SRC}" \
+        2>&1 | tail -5
+
+    ninja -j$(sysctl -n hw.ncpu) 2>&1 | tail -3
+    ninja install 2>&1 | tail -3
+
+    echo "✓ dav1d ${KEY} → ${INSTALL_DIR}"
+}
+
+# ─────────────────────────────────────────────────────────
+# zimg cross-compilation (autotools)
+# ─────────────────────────────────────────────────────────
+
+build_zimg_one() {
+    local KEY="$1" SDK="$2" ARCH="$3" TARGET="$4" MIN_VER="$5"
+
+    echo ""
+    echo "━━━ Building zimg: ${KEY} (${ARCH} for ${SDK}) ━━━"
+
+    local SDK_PATH=$(xcrun --sdk "${SDK}" --show-sdk-path)
+    local INSTALL_DIR="${BUILD_DIR}/zimg-thin/${KEY}"
+    local WORK_DIR="${BUILD_DIR}/zimg-work/${KEY}"
+    rm -rf "${WORK_DIR}" "${INSTALL_DIR}"
+    mkdir -p "${WORK_DIR}" "${INSTALL_DIR}"
+
+    local HOST_TRIPLE="aarch64-apple-darwin"
+    [[ "${ARCH}" == "x86_64" ]] && HOST_TRIPLE="x86_64-apple-darwin"
+
+    local FLAGS="-arch ${ARCH} -isysroot ${SDK_PATH} -target ${TARGET} -fno-common"
+
+    # zimg took autoconf's default CFLAGS ("-g -O2") while this passed none.
+    # Pin both halves so the optimization level stays where it was and the debug
+    # level is the one DEBUG_CFLAG sets.
+    cd "${WORK_DIR}"
+    CC="clang ${FLAGS}" \
+    CXX="clang++ ${FLAGS}" \
+    CFLAGS="-O2 ${DEBUG_CFLAG}" \
+    CXXFLAGS="-O2 ${DEBUG_CFLAG}" \
+    LDFLAGS="-Wl,-headerpad_max_install_names" \
+    "${ZIMG_SRC}/configure" \
+        --host="${HOST_TRIPLE}" \
+        --prefix="${INSTALL_DIR}" \
+        "${CONFIGURE_LINK_FLAGS[@]}" \
+        2>&1 | tail -5
+
+    make -j$(sysctl -n hw.ncpu) 2>&1 | tail -3
+    make install 2>&1 | tail -3
+
+    echo "✓ zimg ${KEY} → ${INSTALL_DIR}"
+}
+
+# ─────────────────────────────────────────────────────────
+# libzvbi cross-compilation (autotools) - DVB teletext subtitle decoding
+# ─────────────────────────────────────────────────────────
+
+build_zvbi_one() {
+    local KEY="$1" SDK="$2" ARCH="$3" TARGET="$4" MIN_VER="$5"
+
+    echo ""
+    echo "━━━ Building zvbi: ${KEY} (${ARCH} for ${SDK}) ━━━"
+
+    local SDK_PATH=$(xcrun --sdk "${SDK}" --show-sdk-path)
+    local INSTALL_DIR="${BUILD_DIR}/zvbi-thin/${KEY}"
+    local WORK_DIR="${BUILD_DIR}/zvbi-work/${KEY}"
+    rm -rf "${WORK_DIR}" "${INSTALL_DIR}"
+    mkdir -p "${WORK_DIR}" "${INSTALL_DIR}"
+
+    local HOST_TRIPLE="aarch64-apple-darwin"
+    [[ "${ARCH}" == "x86_64" ]] && HOST_TRIPLE="x86_64-apple-darwin"
+
+    # -fgnu89-inline: libzvbi's misc.h inline helpers need GNU89 extern-inline emission under clang.
+    local FLAGS="-arch ${ARCH} -isysroot ${SDK_PATH} -target ${TARGET} -fno-common -fgnu89-inline ${DEBUG_CFLAG}"
+
+    cd "${WORK_DIR}"
+    # ac_cv_func_(malloc|realloc)_0_nonnull=yes: AC_FUNC_MALLOC/REALLOC run a runtime probe that cannot
+    # execute when cross-compiling, so autoconf assumes a broken allocator and substitutes gnulib's
+    # rpl_malloc/rpl_realloc, which libzvbi never provides (undefined symbols at the FFmpeg link).
+    CC="clang ${FLAGS}" \
+    CFLAGS="${FLAGS}" \
+    LDFLAGS="-Wl,-headerpad_max_install_names" \
+    ac_cv_func_malloc_0_nonnull=yes \
+    ac_cv_func_realloc_0_nonnull=yes \
+    "${ZVBI_SRC}/configure" \
+        --host="${HOST_TRIPLE}" \
+        --prefix="${INSTALL_DIR}" \
+        "${CONFIGURE_LINK_FLAGS[@]}" \
+        --disable-nls \
+        --disable-tests \
+        --disable-examples \
+        --without-doxygen \
+        --without-x \
+        2>&1 | tail -5
+
+    # --without-x: on a Mac with X11 libraries installed (XQuartz, or Homebrew's libx11 as some formula's
+    # dependency) configure finds them for the macOS slices, whose host matches the build machine, and links
+    # -lX11, which the SDK sysroot does not have: `ld: library 'X11' not found`. The decoder needs no X.
+
+    # Only src/ holds the decoder library; test/ and examples/ are disabled above.
+    make -C src -j$(sysctl -n hw.ncpu) 2>&1 | tail -3
+    make -C src install 2>&1 | tail -3
+    make install-pkgconfigDATA 2>&1 | tail -2
+
+    echo "✓ zvbi ${KEY} → ${INSTALL_DIR}"
+}
+
+# ─────────────────────────────────────────────────────────
+# FFmpeg
+# ─────────────────────────────────────────────────────────
+
+COMMON_FLAGS=(
+    --enable-pic
+    # --disable-stripping: `make install` would otherwise run strip over the
+    # installed libraries and take the debug map with it, leaving dsymutil
+    # nothing to read. make_framework strips the shipped binary itself, after
+    # make_dsym has harvested the symbols.
+    --enable-optimizations --disable-stripping --disable-debug
+    --disable-autodetect --disable-doc --disable-programs
+    --disable-devices --disable-outdevs --disable-indevs
+    --disable-avdevice --enable-avfilter
+    --enable-swscale --disable-encoders --disable-muxers
+    --disable-bsfs --disable-network --disable-protocols
+    --disable-d3d11va --disable-dxva2 --disable-vaapi --disable-vdpau
+    --disable-gray --disable-iconv --disable-bzlib
+    --disable-linux-perf --disable-symver --disable-swscale-alpha
+    --enable-avcodec --enable-avformat --enable-avutil --enable-swresample
+    --enable-libzimg
+    --enable-libzvbi
+    --disable-filters
+    --enable-filter=buffer --enable-filter=buffersink
+    --enable-filter=format --enable-filter=scale
+    --enable-filter=zscale --enable-filter=tonemap
+    --enable-filter=colorspace
+    # Audio shaping for AetherEngine (AE#923): the graph runs between the decoder's
+    # resampler and the renderer or the bridge encoder. dialoguenhance pulls the
+    # dialogue out of a stereo mix (3.0 out) and pan folds it back into the pair,
+    # acompressor is night mode, alimiter the lookahead limiter that keeps every
+    # lift from clipping. All LGPL. abuffer / abuffersink / aformat are the graph's
+    # audio ends and its format pin, aresample the converter libavfilter inserts
+    # between filters that work in different sample formats (alimiter and
+    # acompressor take interleaved double, dialoguenhance planar float).
+    --enable-filter=abuffer --enable-filter=abuffersink --enable-filter=aformat --enable-filter=aresample
+    --enable-filter=dialoguenhance --enable-filter=pan
+    --enable-filter=acompressor --enable-filter=alimiter
+    # Deinterlacers for AetherEngine's software-decode path: interlaced
+    # MPEG-2 / VC-1 / MPEG-4 (DVD rips, SD broadcast) plus interlaced H.264
+    # (AetherEngine #107: AVPlayer does not deinterlace, so 1080i/576i H.264
+    # routes software too). Without these it all renders with combing. bwdif
+    # is the CPU primary (better quality), yadif the fallback.
+    --enable-filter=bwdif --enable-filter=yadif
+    # Inverse telecine (AetherEngine#853): idet tells telecined film from true
+    # interlace, fieldmatch rebuilds the progressive frames from the field pairs
+    # and decimate drops the duplicate one in five, so 3:2 film plays at 23.976
+    # instead of being deinterlaced to 29.97 with judder. All LGPL (mpdecimate
+    # would be GPL and is not needed).
+    --enable-filter=idet --enable-filter=fieldmatch --enable-filter=decimate
+    # Hardware deinterlacer: yadif_videotoolbox runs the yadif kernel as a
+    # Metal compute shader over AV_PIX_FMT_VIDEOTOOLBOX frames (no
+    # bwdif_videotoolbox exists upstream). hwupload bridges software-decoded
+    # frames into a VideoToolbox hwframes context so the GPU can deinterlace
+    # at field rate (mode=send_field) without the 2x CPU cost of sw bwdif.
+    # The dependency chain is "metal corevideo videotoolbox"; Metal is
+    # normally autodetected but --disable-autodetect turns it off, so enable
+    # it explicitly. The .metal kernel compiles at build time via
+    # --metalcc / --metallib, overridden per slice in build_one.
+    --enable-filter=yadif_videotoolbox --enable-filter=hwupload
+    --enable-metal
+    --enable-videotoolbox --enable-audiotoolbox
+    --enable-libdav1d
+    --enable-protocol=file --enable-protocol=pipe --enable-protocol=data
+    # concat is deliberately NOT enabled. It is a script demuxer: a file beginning with
+    # "ffconcat version 1.0" makes libavformat open the paths listed inside it through the
+    # file protocol. Nothing here asks for it by name, so probing was the only way to reach
+    # it, and that made any byte stream a potential file-open primitive. hls and dash stay in:
+    # they are a documented capability of this package (README) and consumers rely on them.
+    --disable-demuxers
+    # dash is NOT enabled: its demuxer needs libxml2, which this build does not link, so
+    # configure answered `Disabled dash_demuxer because not all dependencies are satisfied`
+    # and the flag silently did nothing. Asking for it again without libxml2 would only
+    # restore that false impression. DASH content still arrives through mov/mpegts segments.
+    --enable-demuxer=hls --enable-demuxer=matroska
+    --enable-demuxer=mov --enable-demuxer=mpegts --enable-demuxer=mpegps
+    --enable-demuxer=avi --enable-demuxer=flv --enable-demuxer=h264
+    # asf: native .wmv / .asf. Enabled together with the whole WMA decoder family
+    # below and never without it, see the block there. Unlike the concat demuxer
+    # removed above this is a plain media demuxer, no file-open primitive.
+    --enable-demuxer=asf
+    --enable-demuxer=hevc --enable-demuxer=aac --enable-demuxer=ac3
+    --enable-demuxer=eac3 --enable-demuxer=flac --enable-demuxer=ogg
+    --enable-demuxer=wav --enable-demuxer=mp3 --enable-demuxer=srt
+    --enable-demuxer=ass --enable-demuxer=data
+    # sup: raw PGS/SUP sidecar files (Jellyfin serves external PGS tracks as raw .sup streams;
+    # the pgssub DECODER was always in, but without this demuxer avformat_open_input rejects the
+    # file with AVERROR_INVALIDDATA and external PGS subtitles never load. AetherEngine sidecar path.)
+    --enable-demuxer=sup
+    # webvtt: standalone .vtt sidecar files. The webvtt DECODER was always in (it serves WebVTT
+    # tracks inside Matroska and HLS, where those demuxers supply the stream), but without this
+    # demuxer avformat_open_input rejects a .vtt file with AVERROR_INVALIDDATA and an external
+    # WebVTT subtitle never loads. Same shape as the sup case above. It also carries the cue
+    # settings: the demuxer attaches line/position/align to each packet as
+    # AV_PKT_DATA_WEBVTT_SETTINGS, which is the only path they take (the decoder drops them).
+    --enable-demuxer=webvtt
+    # Raw MPEG-1/2 and MPEG-4 video elementary-stream demuxers. The mpegps
+    # (MPEG Program Stream / DVD VOB) demuxer carries no codec signaling, so
+    # it tags a 0x1E0-0x1EF video stream as request_probe and confirms the
+    # codec via these raw demuxers' probe functions. Without them MPEG-2
+    # video in a Program Stream is never confirmed (the lenient mp3 demuxer
+    # probe wins instead) and no video stream is exposed: DVD-Video ISO
+    # playback shows audio only. The h264/hevc raw demuxers above already
+    # cover H.264/HEVC-in-PS; these add MPEG-2 (DVD) and MPEG-4 Part 2.
+    --enable-demuxer=mpegvideo --enable-demuxer=m4v
+    # Raw DTS, TrueHD and LATM demuxers, for the same reason on the audio side. An
+    # MPEG-TS PID whose stream_type does not name its codec (0x06 without a descriptor,
+    # an unknown type, or 0x04/0x0f, which mpegts re-checks) is resolved by
+    # set_codec_from_probe_data() running these raw demuxers' probes over the payload.
+    # Every codec in that table whose demuxer is missing here can never be confirmed,
+    # and the lenient mp3 probe (score 1 on noise) names the track instead: a DTS-HD
+    # IPTV channel opened as mp3 and every packet failed with "Header missing"
+    # (AetherEngine #641). The decoders (dca, truehd, aac_latm) were always in.
+    --enable-demuxer=dts --enable-demuxer=truehd --enable-demuxer=loas
+    # RealMedia (.rm / .rmvb) and VobSub (.idx + .sub). RealMedia is what most of the
+    # Chinese web's films and series shipped as from 2003 to 2010, so a library carried
+    # over from that time is full of it; VobSub is the DVD-era subtitle sidecar, the
+    # .idx (timing, palette, file offsets) beside a .sub (the subpicture packets as an
+    # MPEG program stream). The vobsub demuxer opens the .sub itself through the file
+    # protocol, by the .idx's own name, and reads it with the mpegps demuxer above, so
+    # a host hands it a local .idx with its .sub next to it. Their decoders are in the
+    # decoder block below, together, for the reason the WMA family is (a container
+    # without its audio decoder plays silently).
+    --enable-demuxer=rm --enable-demuxer=vobsub
+    --disable-decoders
+    --enable-decoder=h264 --enable-decoder=hevc --enable-decoder=vp8
+    --enable-decoder=vp9 --enable-decoder=av1 --enable-decoder=libdav1d
+    --enable-decoder=mpeg2video --enable-decoder=mpeg4 --enable-decoder=vc1
+    --enable-decoder=qtrle
+    # Legacy Microsoft video, the MPEG-4-family tail that pre-2005 AVI rips and
+    # WMV-era remuxes still carry (FFmpegBuild#3). All are native libavcodec
+    # decoders under FFmpeg's LGPL-2.1-or-later terms: no external library, no GPL
+    # flag. msmpeg4v1/v2/v3 and wmv1/wmv2 share the msmpeg4dec object, so once v3
+    # (MS-MPEG4 v3 / "DivX 3.11", the reported case) is in, its siblings cost their
+    # decoder structs plus wmv2dsp; wmv3 (WMV9) selects the already-enabled
+    # vc1_decoder and adds little beyond its own registration. Without them
+    # avcodec_find_decoder returns nil and AetherEngine's software path fails the
+    # load with unsupportedCodec, because since FFmpegBuild#1 the routing default is
+    # software for everything the native path does not carry. The avi demuxer above
+    # is already enabled, so the AVI case is complete with the decoder alone.
+    --enable-decoder=msmpeg4v1 --enable-decoder=msmpeg4v2 --enable-decoder=msmpeg4v3
+    --enable-decoder=wmv1 --enable-decoder=wmv2 --enable-decoder=wmv3
+    # Flash Video, the legacy half. The flv DEMUXER has been on the list above since
+    # the beginning, so a modern .flv (H.264 + AAC, everything after 2008) already
+    # direct-plays; what was missing is the decoder tail of the Flash era. FLV1 is
+    # Sorenson Spark, the H.263 variant of every pre-2008 file, and it shares the
+    # h263 / mpeg4 objects already compiled in; vp6 / vp6a / vp6f are the On2 family
+    # Flash 8 brought and pay for the vp56 core once. Note the registered name: the
+    # FLV1 decoder answers to `flv`, which is also what configure wants here, so a
+    # consumer asking for `flv1` by name finds nothing (AetherEngine dispatches by
+    # id and does not care).
+    #
+    # Flash Screen Video (flashsv / flashsv2) is deliberately out: it needs zlib,
+    # which --disable-autodetect above switches off, so the flag would be dropped
+    # without a word, exactly like the dash demuxer. Screen recordings are also not
+    # what a film library holds. Enabling it means --enable-zlib and counting the
+    # generated decoder list afterwards, not adding a flag.
+    --enable-decoder=flv --enable-decoder=vp6 --enable-decoder=vp6a --enable-decoder=vp6f
+    # Windows Media audio, the whole family, which is what makes the native .wmv /
+    # .asf case complete: demuxer above, video decoders on the line above this one,
+    # sound here. #3 closed the other way in August 2026 on the reporter's answer
+    # that their library holds WMV only inside Matroska and MPEG-TS; a second field
+    # report in September 2026 said the native form does turn up, so the boundary
+    # moved rather than the argument.
+    #
+    # All five, not the two a .wmv usually carries, because this chain is
+    # all-or-nothing by construction. A decoder left out here is a file that plays
+    # SILENTLY: AetherEngine's audio bridge asks libavcodec for a decoder by id, that
+    # lookup returns nothing, and the session falls to video-only, which reads as a
+    # playback bug where an honest unsupported-format error would not. Measured
+    # 2026-09-10 with a codec this build omits: `AudioBridge: no FFmpeg decoder for
+    # source codec id 69633 ... falling back to SILENT video-only`. Note the level:
+    # the host's routing table is NOT what decides this, a codec it does not name
+    # still plays as long as the decoder is here, so the promise is made in this
+    # file and nowhere else. wmav1 / wmav2 are WMA
+    # Standard, wmapro is WMA 9/10 Pro and the usual audio of anything post-2003,
+    # wmalossless and wmavoice are rare in film content and cost tens of KB between
+    # them, which is less than one silent-audio report costs. WMA is not fMP4-legal,
+    # so AetherEngine's AudioBridge decodes and re-encodes it, same as MP2 and
+    # Blu-ray LPCM below. DecoderAvailabilityTests refuses a half set from here on.
+    --enable-decoder=wmav1 --enable-decoder=wmav2 --enable-decoder=wmapro
+    --enable-decoder=wmalossless --enable-decoder=wmavoice
+    # RealMedia, whole for the same all-or-nothing reason as WMA above: RealVideo 1 to
+    # 4 (rv10 / rv20 / rv30 / rv40; an .rmvb is almost always RV40) and every RealAudio
+    # an .rm carries (cook, the usual one; atrac3, sipr, ralf, and the 14.4 / 28.8
+    # speech codecs, which register as real_144 / real_288). AAC in RealMedia (raac /
+    # racp) needs nothing more. All are native libavcodec decoders, LGPL, no external
+    # library.
+    --enable-decoder=rv10 --enable-decoder=rv20 --enable-decoder=rv30 --enable-decoder=rv40
+    --enable-decoder=cook --enable-decoder=atrac3 --enable-decoder=sipr --enable-decoder=ralf
+    --enable-decoder=ra_144 --enable-decoder=ra_288
+    # Phone video, the 3GP / 3G2 that feature phones recorded: H.263 pictures with
+    # AMR narrowband (or wideband) speech, in the mov demuxer that is already here.
+    # The flv decoder above shares the h263 objects, so h263 itself costs little; the
+    # native AMR decoders (not libopencore) are LGPL.
+    --enable-decoder=h263 --enable-decoder=amrnb --enable-decoder=amrwb
+    # Theora, the video of .ogv (the ogg demuxer is already here, and Vorbis); it
+    # selects the vp3 core.
+    --enable-decoder=theora
+    # DVD LPCM (pcm_dvd), the uncompressed audio some DVDs (concerts, music titles)
+    # carry in their VOBs; Blu-ray LPCM is pcm_bluray below.
+    --enable-decoder=pcm_dvd
+    --enable-decoder=aac --enable-decoder=aac_latm --enable-decoder=ac3
+    --enable-decoder=eac3 --enable-decoder=flac --enable-decoder=mp3
+    --enable-decoder=mp3float --enable-decoder=opus --enable-decoder=vorbis
+    --enable-decoder=truehd --enable-decoder=mlp --enable-decoder=dca --enable-decoder=alac
+    --enable-decoder=pcm_s16le --enable-decoder=pcm_s24le --enable-decoder=pcm_f32le
+    # Flash Video audio, the whole tail, all-or-nothing for the same reason the WMA
+    # family above is: a decoder missing here is a file that plays as a silent film
+    # rather than failing honestly, because the bridge has nothing to open. Nellymoser Asao and ADPCM-SWF are what the
+    # Flash era recorded, speex is its voice codec (native decoder, no libspeex),
+    # and FLV's PCM shapes are big-endian S16, unsigned 8-bit and G.711 A-law /
+    # mu-law, none of which the little-endian line above carries. None is fMP4-legal,
+    # so every one of them goes through AudioBridge. Tens of KB between them.
+    --enable-decoder=nellymoser --enable-decoder=adpcm_swf --enable-decoder=speex
+    --enable-decoder=pcm_s16be --enable-decoder=pcm_u8
+    --enable-decoder=pcm_alaw --enable-decoder=pcm_mulaw
+    # Blu-ray LPCM (PCM_BLURAY): M2TS audio tracks that ship raw LPCM. Not
+    # legal in fMP4, so AetherEngine's AudioBridge decodes to PCM and
+    # re-encodes; without the decoder those tracks are silent. Prep for
+    # Blu-ray ISO support (Phase 2); harmless for everything else.
+    --enable-decoder=pcm_bluray
+    # MP2 (MPEG-1 Layer II) decoder for DVD-remux audio tracks that
+    # still carry MP2. Not legal in fMP4 so AetherEngine's AudioBridge
+    # decodes to PCM and re-encodes as FLAC. ~5 KB binary cost.
+    --enable-decoder=mp2
+    --enable-decoder=ass --enable-decoder=srt --enable-decoder=subrip
+    --enable-decoder=movtext --enable-decoder=dvdsub --enable-decoder=dvbsub
+    --enable-decoder=pgssub --enable-decoder=webvtt
+    --enable-decoder=libzvbi_teletext
+    --disable-parsers
+    --enable-parser=aac --enable-parser=aac_latm --enable-parser=ac3
+    --enable-parser=flac --enable-parser=h264 --enable-parser=hevc
+    --enable-parser=mpegaudio --enable-parser=mpeg4video
+    --enable-parser=mpegvideo --enable-parser=opus --enable-parser=vorbis
+    --enable-parser=vp8 --enable-parser=vp9 --enable-parser=av1
+    # dca parser coalesces a DTS core frame and the following DTS-HD extension
+    # substream (EXSS) into one packet. Without it, the MPEG-TS demuxer hands the
+    # decoder the core (0x7FFE8001) and the EXSS (0x64582025) as SEPARATE packets,
+    # so a DTS-HD MA EXSS arrives with no core and the decoder rejects every frame
+    # with "Residual encoded channels are present without core" (silent audio on
+    # Blu-ray M2TS; AetherEngine #64). Matroska is unaffected (its blocks are
+    # already whole frames), which is why only the .m2ts path was silent.
+    --enable-parser=dca
+    # Same framing-completeness class as dca, for the other enabled decoders whose
+    # frames the MPEG-TS / MPEG-PS demuxer can only deliver correctly with a parser:
+    #   mlp  -> TrueHD / MLP (common on Blu-ray M2TS; the AudioBridge decodes it).
+    #           Without it, TrueHD access units mis-frame exactly like DTS-HD MA did.
+    #   vc1  -> VC-1 video (Blu-ray, WMV); the software decode path needs framed BDUs.
+    #   dvbsub / dvdsub -> DVB (live TS) and DVD (Program Stream / VOB) bitmap subtitles.
+    #           Defensive: matches a stock FFmpeg build so live-TV / DVD subtitle
+    #           framing is correct rather than relying on PES-aligned delivery.
+    --enable-parser=mlp --enable-parser=vc1
+    --enable-parser=dvbsub --enable-parser=dvdsub
+    --enable-bsf=aac_adtstoasc --enable-bsf=h264_mp4toannexb
+    --enable-bsf=hevc_mp4toannexb --enable-bsf=extract_extradata
+    # dca_core extracts the mandatory DTS core substream from a DTS-HD
+    # (MA / HRA) packet at the bitstream level. AetherEngine's AudioBridge
+    # runs DTS through it before decode so the lossless XLL extension (which
+    # residual-codes channels and can fail to reconstruct standalone) is
+    # dropped up front; the bridge re-encodes lossy anyway. Yields clean
+    # full-rate 5.1/7.1 core PCM on every frame (AetherEngine #64).
+    --enable-bsf=dca_core
+    # MP4 / mov muxers underlie the per-fragment fmp4 segment output;
+    # the hls muxer drives the segmentation + per-segment styp emission
+    # + playlist for AetherEngine's HLSVideoEngine. We override
+    # `s->io_open` / `s->io_close2` so segment writes land in Swift
+    # memory rather than on disk, but the muxer's logic itself is
+    # libavformat's hlsenc.c verbatim, byte-identical to
+    # `ffmpeg -f hls -hls_segment_type fmp4`.
+    --enable-muxer=mp4 --enable-muxer=mov --enable-muxer=hls
+    # FLAC encoder kept for stereo / lossless paths and CLI tools.
+    --enable-encoder=flac
+    # EAC3 encoder for the multichannel bridge. AVPlayer decodes FLAC
+    # to LPCM and routes that through the active HDMI port's channel
+    # count — most consumer soundbars (Sonos Arc and equivalents)
+    # accept multichannel only via bitstream codecs (EAC3, AC3, DD+,
+    # Atmos), not LPCM, so a 7.1 FLAC track gets downmixed to stereo
+    # at the route. EAC3 5.1 bridges that gap: AVPlayer hands the
+    # encoded bitstream to HDMI, the sink decodes its own 5.1 mix,
+    # surround works on every device that decodes EAC3 (which is
+    # essentially every modern AVR + soundbar). Trade-off: lossy
+    # (~384 kbps for 5.1) versus the FLAC bridge's lossless, but
+    # tvOS doesn't expose LPCM-side audio passthrough that the
+    # lossless was actually delivering on most setups anyway.
+    --enable-encoder=eac3
+    # AAC (LC) and ALAC, plus the AC-3 encoder E-AC-3 already pulls in:
+    # AetherEngine pads a stream-copied track whose audio ends before its
+    # video with silence in the track's own codec (AetherEngine#847),
+    # because AVPlayer ends an item the moment its audio runs out. Both
+    # are FFmpeg's native encoders, no external library.
+    --enable-encoder=aac --enable-encoder=alac
+)
+
+build_one() {
+    local KEY="$1" SDK="$2" ARCH="$3" TARGET="$4" MIN_VER="$5"
+
+    echo ""
+    echo "━━━ Building FFmpeg: ${KEY} (${ARCH} for ${SDK}) ━━━"
+
+    local SDK_PATH=$(xcrun --sdk "${SDK}" --show-sdk-path)
+    local INSTALL_DIR="${BUILD_DIR}/thin/${KEY}"
+    local DAV1D_DIR="${BUILD_DIR}/dav1d-thin/${KEY}"
+    local ZIMG_DIR="${BUILD_DIR}/zimg-thin/${KEY}"
+    local ZVBI_DIR="${BUILD_DIR}/zvbi-thin/${KEY}"
+    rm -rf "${INSTALL_DIR}"
+    mkdir -p "${INSTALL_DIR}"
+
+    local CFLAGS="-arch ${ARCH} -isysroot ${SDK_PATH} -target ${TARGET} -fno-common -DHAVE_FORK=0 ${DEBUG_CFLAG}"
+    local LDFLAGS="-arch ${ARCH} -isysroot ${SDK_PATH} -target ${TARGET} -Wl,-headerpad_max_install_names"
+
+    # Add dav1d include/lib paths
+    CFLAGS="${CFLAGS} -I${DAV1D_DIR}/include"
+    LDFLAGS="${LDFLAGS} -L${DAV1D_DIR}/lib"
+
+    # Add zimg include/lib paths (zimg is C++, so the FFmpeg link needs -lc++)
+    CFLAGS="${CFLAGS} -I${ZIMG_DIR}/include"
+    LDFLAGS="${LDFLAGS} -L${ZIMG_DIR}/lib -lc++"
+
+    # Add libzvbi include/lib paths (DVB teletext decoding; -liconv for teletext charset conversion)
+    CFLAGS="${CFLAGS} -I${ZVBI_DIR}/include"
+    LDFLAGS="${LDFLAGS} -L${ZVBI_DIR}/lib -liconv"
+
+    local ASM_FLAGS=(--enable-neon)
+    [[ "${ARCH}" == "x86_64" ]] && ASM_FLAGS=(--disable-asm --disable-neon)
+
+    # Metal shader cross-compilation for yadif_videotoolbox. The compiled
+    # metallib is embedded into libavfilter and loaded at runtime with
+    # newLibraryWithData:, so it must target the slice's SDK/OS. configure's
+    # default (xcrun -sdk macosx metal) yields a macOS metallib that fails to
+    # load on iOS/tvOS. AIR is arch-independent; air64 covers arm64 + x86_64.
+    local AIR_TARGET="${TARGET/${ARCH}/air64}"
+    local METAL_FLAGS=(
+        --metalcc="xcrun -sdk ${SDK} metal -target ${AIR_TARGET}"
+        --metallib="xcrun -sdk ${SDK} metallib"
+    )
+
+    local WORK_DIR="${BUILD_DIR}/work/${KEY}"
+    rm -rf "${WORK_DIR}"
+    mkdir -p "${WORK_DIR}"
+    cd "${WORK_DIR}"
+
+    # Set pkg-config path so FFmpeg's configure can find dav1d
+    export PKG_CONFIG_PATH="${DAV1D_DIR}/lib/pkgconfig:${ZIMG_DIR}/lib/pkgconfig:${ZVBI_DIR}/lib/pkgconfig"
+
+    "${FFMPEG_SRC}/configure" \
+        --prefix="${INSTALL_DIR}" \
+        --enable-cross-compile \
+        --target-os=darwin \
+        --arch="${ARCH}" \
+        --cc="/usr/bin/clang" \
+        --extra-cflags="${CFLAGS}" \
+        --extra-ldflags="${LDFLAGS}" \
+        "${ASM_FLAGS[@]}" \
+        "${METAL_FLAGS[@]}" \
+        "${CONFIGURE_LINK_FLAGS[@]}" \
+        "${COMMON_FLAGS[@]}" \
+        2>&1 | tail -5
+
+    make -j$(sysctl -n hw.ncpu) 2>&1 | tail -3
+    make install 2>&1 | tail -3
+
+    echo "✓ FFmpeg ${KEY} → ${INSTALL_DIR}"
+}
+
+# The compilers record absolute build-directory install names (FFmpeg,
+# libtool) or bare @rpath dylib names (meson). Rewrite the binary's own id
+# and every reference to a sibling library to @rpath framework paths so the
+# frameworks resolve when embedded in an app bundle.
+fix_install_names() {
+    local BIN="$1" FW="$2" PLATFORM="$3"
+
+    local SUBPATH="${FW}.framework/${FW}"
+    [[ "${PLATFORM}" == "macos" ]] && SUBPATH="${FW}.framework/Versions/A/${FW}"
+    install_name_tool -id "@rpath/${SUBPATH}" "${BIN}"
+
+    local PAIRS=(
+        "libavcodec:AetherLibavcodec" "libavformat:AetherLibavformat" "libavutil:AetherLibavutil"
+        "libswresample:AetherLibswresample" "libswscale:AetherLibswscale" "libavfilter:AetherLibavfilter"
+        "libdav1d:AetherLibdav1d" "libzimg:AetherLibzimg" "libzvbi:AetherLibzvbi"
+    )
+    local DEPS
+    DEPS=(${(f)"$(otool -L "${BIN}" | awk 'NR>1 {print $1}')"})
+    local DEP PAIR NAME TARGET_FW NEW
+    for DEP in "${DEPS[@]}"; do
+        local BASE="${DEP##*/}"
+        for PAIR in "${PAIRS[@]}"; do
+            NAME="${PAIR%%:*}"
+            TARGET_FW="${PAIR##*:}"
+            if [[ "${BASE}" == ${NAME}.dylib || "${BASE}" == ${NAME}.*.dylib ]]; then
+                NEW="${TARGET_FW}.framework/${TARGET_FW}"
+                [[ "${PLATFORM}" == "macos" ]] && NEW="${TARGET_FW}.framework/Versions/A/${TARGET_FW}"
+                install_name_tool -change "${DEP}" "@rpath/${NEW}" "${BIN}"
+            fi
+        done
+    done
+}
+
+# Absolute path of one thin library, by library name and slice key. Shared by
+# the lipo step and make_dsym so the two can never disagree about what they are
+# looking at.
+thin_lib_path() {
+    local LIB="$1" KEY="$2" EXT="a"
+    [[ "${LINKAGE}" == "dynamic" ]] && EXT="dylib"
+    case "${LIB}" in
+        dav1d) echo "${BUILD_DIR}/dav1d-thin/${KEY}/lib/libdav1d.${EXT}" ;;
+        zimg)  echo "${BUILD_DIR}/zimg-thin/${KEY}/lib/libzimg.${EXT}" ;;
+        zvbi)  echo "${BUILD_DIR}/zvbi-thin/${KEY}/lib/libzvbi.${EXT}" ;;
+        *)     echo "${BUILD_DIR}/thin/${KEY}/lib/${LIB}.${EXT}" ;;
+    esac
+}
+
+# A crash inside these libraries only symbolicates if the archive carries a dSYM
+# whose UUID matches the shipped binary. The linker leaves a debug map in the
+# thin dylib pointing at the .o files under build/work; dsymutil follows it and
+# writes the DWARF into a bundle. Both survive everything make_framework does
+# afterwards (verified: lipo, install_name_tool, strip -x and codesign all leave
+# LC_UUID alone), so the stripped binary we ship and this dSYM stay a pair.
+make_dsym() {
+    local LIB="$1" FW="$2" PLATFORM="$3"
+    shift 3
+    local KEYS=("$@")
+
+    local DSYM="${BUILD_DIR}/dsyms/${PLATFORM}/${FW}.framework.dSYM"
+    rm -rf "${DSYM}"
+    mkdir -p "${DSYM}/Contents/Resources/DWARF"
+
+    local DWARFS=() K THIN OUT
+    for K in "${KEYS[@]}"; do
+        THIN="$(thin_lib_path "${LIB}" "${K}")"
+        OUT="${BUILD_DIR}/dsyms/thin/${K}/${FW}.dSYM"
+        rm -rf "${OUT}"
+        mkdir -p "${BUILD_DIR}/dsyms/thin/${K}"
+        dsymutil --out "${OUT}" "${THIN}"
+        local FOUND=("${OUT}/Contents/Resources/DWARF/"*(N))
+        if (( ${#FOUND} == 0 )); then
+            echo "✗ ${FW} (${K}): no debug info. The object files under build/work/${K}"
+            echo "  are what dsymutil reads, so a repackage after a clean cannot produce"
+            echo "  dSYMs. Run a full ./build.sh instead."
+            exit 1
+        fi
+        DWARFS+=("${FOUND[1]}")
+    done
+
+    lipo -create "${DWARFS[@]}" -output "${DSYM}/Contents/Resources/DWARF/${FW}"
+
+    cat > "${DSYM}/Contents/Info.plist" << EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>CFBundleDevelopmentRegion</key><string>English</string>
+<key>CFBundleIdentifier</key><string>com.apple.xcode.dsym.com.aetherengine.${FW}</string>
+<key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
+<key>CFBundlePackageType</key><string>dSYM</string>
+<key>CFBundleSignature</key><string>????</string>
+<key>CFBundleShortVersionString</key><string>1.0</string>
+<key>CFBundleVersion</key><string>1</string>
+</dict></plist>
+EOF
+}
+
+# Apple's required-reason APIs (ITMS-91053) are declared by the framework that
+# calls them, so an app embedding these does not declare them on our behalf
+# (FFmpegBuild#10). The manifest follows the symbols the binary actually imports,
+# so an upstream update that starts or stops calling one changes it too.
+write_privacy_manifest() {
+    local FW_DIR="$1" BINARY="$2"
+    local -a IMPORTS
+    IMPORTS=(${(f)"$(nm -u "${BINARY}" 2>/dev/null | sed -E 's/^[[:space:]]*_//; s/\$INODE64$//' | sort -u)"})
+    local FILE_TS=0 DISK=0 BOOT=0 SYM
+    for SYM in "${IMPORTS[@]}"; do
+        case "${SYM}" in
+            stat|fstat|lstat|fstatat|getattrlist|fgetattrlist|getattrlistat|getattrlistbulk) FILE_TS=1 ;;
+            statfs|fstatfs|statvfs|fstatvfs) DISK=1 ;;
+            mach_absolute_time) BOOT=1 ;;
+        esac
+    done
+    (( FILE_TS + DISK + BOOT )) || return 0
+
+    # C617.1: the host's own temp and cache files; 3B52.1: media the user opened.
+    # E174.1: checking for room before writing; 35F9.1: elapsed time.
+    local ENTRIES=""
+    (( FILE_TS )) && ENTRIES+="<dict><key>NSPrivacyAccessedAPIType</key><string>NSPrivacyAccessedAPICategoryFileTimestamp</string><key>NSPrivacyAccessedAPITypeReasons</key><array><string>C617.1</string><string>3B52.1</string></array></dict>
+"
+    (( DISK )) && ENTRIES+="<dict><key>NSPrivacyAccessedAPIType</key><string>NSPrivacyAccessedAPICategoryDiskSpace</string><key>NSPrivacyAccessedAPITypeReasons</key><array><string>E174.1</string></array></dict>
+"
+    (( BOOT )) && ENTRIES+="<dict><key>NSPrivacyAccessedAPIType</key><string>NSPrivacyAccessedAPICategorySystemBootTime</string><key>NSPrivacyAccessedAPITypeReasons</key><array><string>35F9.1</string></array></dict>
+"
+    cat > "${FW_DIR}/PrivacyInfo.xcprivacy" << EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>NSPrivacyTracking</key><false/>
+<key>NSPrivacyTrackingDomains</key><array/>
+<key>NSPrivacyCollectedDataTypes</key><array/>
+<key>NSPrivacyAccessedAPITypes</key><array>
+${ENTRIES}</array>
+</dict></plist>
+EOF
+    plutil -lint -s "${FW_DIR}/PrivacyInfo.xcprivacy" || { echo "ERROR: ${FW_DIR:t} privacy manifest does not parse"; exit 1; }
+}
+
+make_framework() {
+    local LIB="$1" FW="$2" PLATFORM="$3"
+    shift 3
+    local KEYS=("$@")
+
+    local FW_DIR="${BUILD_DIR}/frameworks/${PLATFORM}/${FW}.framework"
+    rm -rf "${FW_DIR}"
+    mkdir -p "${FW_DIR}/Headers" "${FW_DIR}/Modules"
+
+    # Headers from first arch
+    local HEADER_SRC="${BUILD_DIR}/thin/${KEYS[1]}/include/${LIB}"
+    # For dav1d, headers are in a different location
+    [[ "${LIB}" == "dav1d" ]] && HEADER_SRC="${BUILD_DIR}/dav1d-thin/${KEYS[1]}/include/dav1d"
+    # For zimg, headers install directly under include/
+    [[ "${LIB}" == "zimg" ]] && HEADER_SRC="${BUILD_DIR}/zimg-thin/${KEYS[1]}/include"
+    # For zvbi, the umbrella header installs directly under include/
+    [[ "${LIB}" == "zvbi" ]] && HEADER_SRC="${BUILD_DIR}/zvbi-thin/${KEYS[1]}/include"
+
+    if [[ "${LIB}" == "zimg" ]]; then
+        # Ship only the C API header; zimg++.hpp would put C++ into the
+        # framework module. No Swift consumer imports AetherLibzimg directly
+        # (it is a link-only dependency of libavfilter).
+        cp "${HEADER_SRC}/zimg.h" "${FW_DIR}/Headers/"
+    elif [[ "${LIB}" == "zvbi" ]]; then
+        # Link-only dependency of libavcodec (the teletext decoder wrapper is
+        # already compiled into libavcodec). Ship just the umbrella C header.
+        cp "${HEADER_SRC}/libzvbi.h" "${FW_DIR}/Headers/"
+    elif [[ -d "${HEADER_SRC}" ]]; then
+        cp -R "${HEADER_SRC}/"* "${FW_DIR}/Headers/"
+    fi
+
+    # Remove platform-specific hwcontext headers (FFmpeg only)
+    if [[ "${LIB}" == lib* ]]; then
+        rm -f "${FW_DIR}/Headers/hwcontext_amf.h" \
+              "${FW_DIR}/Headers/hwcontext_cuda.h" \
+              "${FW_DIR}/Headers/hwcontext_d3d11va.h" \
+              "${FW_DIR}/Headers/hwcontext_d3d12va.h" \
+              "${FW_DIR}/Headers/hwcontext_drm.h" \
+              "${FW_DIR}/Headers/hwcontext_dxva2.h" \
+              "${FW_DIR}/Headers/hwcontext_mediacodec.h" \
+              "${FW_DIR}/Headers/hwcontext_oh.h" \
+              "${FW_DIR}/Headers/hwcontext_opencl.h" \
+              "${FW_DIR}/Headers/hwcontext_qsv.h" \
+              "${FW_DIR}/Headers/hwcontext_vaapi.h" \
+              "${FW_DIR}/Headers/hwcontext_vdpau.h" \
+              "${FW_DIR}/Headers/hwcontext_vulkan.h"
+    fi
+
+    # The frameworks ship under an Aether prefix (see the PAIRS arrays) so this
+    # build can sit in one app next to another FFmpeg. Clang resolves a header's
+    # `#include "libavutil/frame.h"` as a framework include, case-insensitively,
+    # which is how these headers found their siblings while the frameworks were
+    # named Libavutil and friends. Under the prefix that lookup finds nothing,
+    # so rewrite the cross-includes to name the frameworks we actually ship.
+    # FFmpeg headers only: dav1d, zimg and zvbi do not include FFmpeg.
+    if [[ "${LIB}" == lib* ]]; then
+        local SIBLING
+        for SIBLING in libavcodec libavformat libavutil libswresample libswscale libavfilter; do
+            local UPPER="Aether${(C)SIBLING[1]}${SIBLING:1}"
+            LC_ALL=C sed -i '' -E "s|(#include[[:space:]]*\")${SIBLING}/|\\1${UPPER}/|g" \
+                "${FW_DIR}/Headers/"*.h
+        done
+    fi
+
+    # Lipo
+    local INPUTS=()
+    for K in "${KEYS[@]}"; do
+        INPUTS+=("$(thin_lib_path "${LIB}" "${K}")")
+    done
+    lipo -create "${INPUTS[@]}" -output "${FW_DIR}/${FW}"
+
+    if [[ "${LINKAGE}" == "dynamic" ]]; then
+        make_dsym "${LIB}" "${FW}" "${PLATFORM}" "${KEYS[@]}"
+        fix_install_names "${FW_DIR}/${FW}" "${FW}" "${PLATFORM}"
+        strip -x "${FW_DIR}/${FW}" 2>/dev/null || true
+    fi
+
+    # Module map
+    cat > "${FW_DIR}/Modules/module.modulemap" << EOF
+framework module ${FW} [system] {
+    umbrella "."
+    exclude header "d3d11va.h"
+    exclude header "d3d12va.h"
+    exclude header "dxva2.h"
+    exclude header "qsv.h"
+    exclude header "vdpau.h"
+    export *
+}
+EOF
+    # Info.plist: App Store submission rejects bundles missing
+    # CFBundleShortVersionString or MinimumOSVersion (ITMS-90057,
+    # ITMS-90360), and ALSO rejects when an embedded framework's
+    # MinimumOSVersion is *lower* than the host app's deployment
+    # target (ITMS-90208). We pick floors that match the apps that
+    # actually consume this build (JellySeeTV is tvOS 26+).
+    local MIN_OS SUPPORTED_PLATFORM
+    case "${PLATFORM}" in
+        ios)         MIN_OS="26.0"; SUPPORTED_PLATFORM="iPhoneOS" ;;
+        isimulator)  MIN_OS="26.0"; SUPPORTED_PLATFORM="iPhoneSimulator" ;;
+        tvos)        MIN_OS="26.0"; SUPPORTED_PLATFORM="AppleTVOS" ;;
+        tvsimulator) MIN_OS="26.0"; SUPPORTED_PLATFORM="AppleTVSimulator" ;;
+        xros)        MIN_OS="1.0";  SUPPORTED_PLATFORM="XROS" ;;
+        xrsimulator) MIN_OS="1.0";  SUPPORTED_PLATFORM="XRSimulator" ;;
+        macos)       MIN_OS="14.0"; SUPPORTED_PLATFORM="MacOSX" ;;
+        *)           MIN_OS="26.0"; SUPPORTED_PLATFORM="iPhoneOS" ;;
+    esac
+
+    cat > "${FW_DIR}/Info.plist" << EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>CFBundleExecutable</key><string>${FW}</string>
+<key>CFBundleIdentifier</key><string>com.aetherengine.${FW}</string>
+<key>CFBundleName</key><string>${FW}</string>
+<key>CFBundleVersion</key><string>1.0</string>
+<key>CFBundleShortVersionString</key><string>1.0</string>
+<key>CFBundlePackageType</key><string>FMWK</string>
+<key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
+<key>CFBundleSupportedPlatforms</key><array><string>${SUPPORTED_PLATFORM}</string></array>
+<key>MinimumOSVersion</key><string>${MIN_OS}</string>
+</dict></plist>
+EOF
+
+    write_privacy_manifest "${FW_DIR}" "${FW_DIR}/${FW}"
+
+    # macOS requires the versioned ("deep") framework bundle layout, with the
+    # binary/Headers/Modules under Versions/A and Info.plist in
+    # Versions/A/Resources. iOS/tvOS use shallow bundles (everything at the
+    # root), which is what we built above. Restructure only the macOS
+    # framework, otherwise Xcode 15+/26 rejects it during embedded-framework
+    # validation: "contains Info.plist, expected
+    # Versions/Current/Resources/Info.plist since the platform does not use
+    # shallow bundles".
+    if [[ "${PLATFORM}" == "macos" ]]; then
+        local V="${FW_DIR}/Versions/A"
+        mkdir -p "${V}/Resources"
+        mv "${FW_DIR}/${FW}"      "${V}/${FW}"
+        mv "${FW_DIR}/Headers"    "${V}/Headers"
+        mv "${FW_DIR}/Modules"    "${V}/Modules"
+        mv "${FW_DIR}/Info.plist" "${V}/Resources/Info.plist"
+        [[ -f "${FW_DIR}/PrivacyInfo.xcprivacy" ]] && mv "${FW_DIR}/PrivacyInfo.xcprivacy" "${V}/Resources/PrivacyInfo.xcprivacy"
+        ln -s "A"                          "${FW_DIR}/Versions/Current"
+        ln -s "Versions/Current/${FW}"     "${FW_DIR}/${FW}"
+        ln -s "Versions/Current/Headers"   "${FW_DIR}/Headers"
+        ln -s "Versions/Current/Modules"   "${FW_DIR}/Modules"
+        ln -s "Versions/Current/Resources" "${FW_DIR}/Resources"
+    fi
+
+    # install_name_tool and strip invalidate the linker's ad-hoc signature;
+    # re-sign so the dylibs stay loadable (Xcode re-signs on embed anyway).
+    if [[ "${LINKAGE}" == "dynamic" ]]; then
+        codesign --force --sign - "${FW_DIR}"
+    fi
+}
+
+make_xcframeworks() {
+    echo ""
+    echo "━━━ Creating XCFrameworks ━━━"
+
+    local PAIRS=("libavcodec:AetherLibavcodec" "libavformat:AetherLibavformat" "libavutil:AetherLibavutil" "libswresample:AetherLibswresample" "libswscale:AetherLibswscale" "libavfilter:AetherLibavfilter" "dav1d:AetherLibdav1d" "zimg:AetherLibzimg" "zvbi:AetherLibzvbi")
+
+    for PAIR in "${PAIRS[@]}"; do
+        local LIB="${PAIR%%:*}"
+        local FW="${PAIR##*:}"
+
+        make_framework "$LIB" "$FW" "ios"          ios-arm64
+        make_framework "$LIB" "$FW" "isimulator"   isimulator-arm64 isimulator-x86_64
+        make_framework "$LIB" "$FW" "tvos"         tvos-arm64
+        make_framework "$LIB" "$FW" "tvsimulator"  tvsimulator-arm64 tvsimulator-x86_64
+        make_framework "$LIB" "$FW" "xros"         xros-arm64
+        make_framework "$LIB" "$FW" "xrsimulator"  xrsimulator-arm64
+        make_framework "$LIB" "$FW" "macos"        macos-arm64 macos-x86_64
+
+        local XCF="${OUTPUT_DIR}/${FW}.xcframework"
+        rm -rf "${XCF}"
+
+        # The dSYMs ride along for every slice that can end up in a shipped
+        # app, so Xcode copies them into the archive on its own and a crash
+        # inside FFmpeg symbolicates without the adopter doing anything. A
+        # simulator slice reaches neither an archive nor a user's crash report,
+        # and its dSYMs would be another 45 MB of committed binaries, so those
+        # stay out of the xcframework (build/dsyms keeps them for local use).
+        echo "  → ${FW}.xcframework"
+        local ARGS=()
+        local P=""
+        for P in ios isimulator tvos tvsimulator xros xrsimulator macos; do
+            ARGS+=(-framework "${BUILD_DIR}/frameworks/${P}/${FW}.framework")
+            if [[ "${LINKAGE}" == "dynamic" && "${P}" != *simulator ]]; then
+                ARGS+=(-debug-symbols "${BUILD_DIR}/dsyms/${P}/${FW}.framework.dSYM")
+            fi
+        done
+        xcodebuild -create-xcframework "${ARGS[@]}" -output "${XCF}" 2>&1 | tail -1
+        echo "  ✓ ${FW}.xcframework"
+    done
+}
+
+# ─────────────────────────────────────────────────────────
+# Build record (BUILD-INFO.txt)
+# ─────────────────────────────────────────────────────────
+# The committed binaries are built on a local Mac, so the only provenance a
+# consumer gets is what this writes next to them: the inputs (upstream commits,
+# a hash of the changes the patch functions made, toolchain and SDK versions),
+# FFmpeg's configure line per slice and the hash of every shipped binary. The
+# inputs are captured right after patching, before anything is compiled, so a
+# later `package` run cannot attribute today's toolchain to yesterday's objects.
+
+first_line() {
+    local OUT
+    OUT="$("$@" 2>&1)" || true
+    print -r -- "${OUT%%$'\n'*}"
+}
+
+source_state() {
+    local NAME="$1" DIR="$2" TAG="$3"
+    local COMMIT CHANGED DIGEST
+    COMMIT="$(git -C "${DIR}" rev-parse HEAD)"
+    CHANGED="$(git -C "${DIR}" status --porcelain | awk '{print $2}' | tr '\n' ' ')"
+    # Tracked edits as a binary diff plus every untracked file (the zvbi stub)
+    # by name and content; generated build files are gitignored upstream.
+    DIGEST="$({
+        git -C "${DIR}" diff HEAD --binary
+        git -C "${DIR}" ls-files --others --exclude-standard | sort | while read -r F; do
+            print -r -- "+++ ${F}"
+            cat "${DIR}/${F}"
+        done
+    } | shasum -a 256 | cut -d' ' -f1)"
+    echo "${NAME} ${TAG} ${COMMIT}"
+    if [[ -n "${CHANGED}" ]]; then
+        echo "  changes sha256 ${DIGEST}: ${CHANGED% }"
+    else
+        echo "  unmodified"
+    fi
+}
+
+record_build_inputs() {
+    local OUT="${BUILD_DIR}/build-inputs.txt"
+    local DIRTY="" P SDK T
+    git -C "${SCRIPT_DIR}" diff --quiet HEAD -- build.sh patches || DIRTY=" (build.sh or patches/ differ from it)"
+    mkdir -p "${BUILD_DIR}"
+    {
+        echo "Built      $(date -u +%Y-%m-%dT%H:%M:%SZ), linkage ${LINKAGE}"
+        echo "Repo HEAD  $(git -C "${SCRIPT_DIR}" rev-parse HEAD)${DIRTY}"
+        echo "build.sh   sha256 $(shasum -a 256 "${SCRIPT_DIR}/build.sh" | cut -d' ' -f1)"
+        for P in "${SCRIPT_DIR}"/patches/*(N); do
+            echo "patches/${P:t}  sha256 $(shasum -a 256 "${P}" | cut -d' ' -f1)"
+        done
+        echo ""
+        echo "## Host and toolchain"
+        echo "macOS      $(sw_vers -productVersion) ($(sw_vers -buildVersion)), $(uname -m)"
+        echo "Xcode      $(xcodebuild -version | tr '\n' ' ' | sed 's/ $//')"
+        echo "clang      $(first_line xcrun clang --version)"
+        for SDK in iphoneos iphonesimulator appletvos appletvsimulator xros xrsimulator macosx; do
+            echo "SDK        ${SDK} $(xcrun --sdk "${SDK}" --show-sdk-version) ($(xcrun --sdk "${SDK}" --show-sdk-build-version))"
+        done
+        for T in meson ninja autoconf automake glibtool pkg-config; do
+            echo "${(r:11:)T}$(first_line "${T}" --version)"
+        done
+        echo "perl       $(perl -e 'print $^V')"
+        echo ""
+        echo "## Sources (tag, commit, hash of the changes the patch functions made)"
+        source_state FFmpeg  "${FFMPEG_SRC}" "${FFMPEG_VERSION}"
+        source_state dav1d   "${DAV1D_SRC}"  "${DAV1D_VERSION}"
+        source_state zimg    "${ZIMG_SRC}"   "${ZIMG_VERSION}"
+        source_state libzvbi "${ZVBI_SRC}"   "${ZVBI_VERSION}"
+    } > "${OUT}"
+    echo "→ Build inputs recorded in ${OUT#${SCRIPT_DIR}/}"
+}
+
+write_build_info() {
+    local OUT="${SCRIPT_DIR}/BUILD-INFO.txt"
+    local INPUTS="${BUILD_DIR}/build-inputs.txt"
+    local C F KIND
+    {
+        echo "# FFmpegBuild build record"
+        echo ""
+        echo "Written by build.sh. Inputs are captured after patching, outputs after packaging."
+        [[ "${MODE}" == "package" ]] && echo "Repackaged $(date -u +%Y-%m-%dT%H:%M:%SZ) from existing build products."
+        echo ""
+        if [[ -f "${INPUTS}" ]]; then
+            cat "${INPUTS}"
+        else
+            echo "Inputs: not recorded (no build has run in this tree since build records were added)"
+        fi
+        echo ""
+        echo "## FFmpeg configure line per slice (repo root shown as <repo>)"
+        # Matched on the build tree rather than on SCRIPT_DIR: the compile and a later
+        # repackage can reach this checkout through different paths (~/Dev is a symlink),
+        # and the line keeps whichever one the compile saw.
+        for C in "${BUILD_DIR}"/work/*/config.h(N); do
+            echo "${C:h:t}: $(sed -n 's/^#define FFMPEG_CONFIGURATION "\(.*\)"$/\1/p' "${C}" | sed -E "s#/[^ =']*(/build/(thin|dav1d-thin|zimg-thin|zvbi-thin)/)#<repo>\1#g")"
+        done
+        echo ""
+        echo "## Shipped binaries (sha256)"
+        find "${OUTPUT_DIR}" -name '*.dSYM' -prune -o -type f -print | sort | while read -r F; do
+            KIND="$(file -b "${F}")"
+            [[ "${KIND}" == Mach-O* || "${KIND}" == "current ar archive"* ]] || continue
+            echo "$(shasum -a 256 "${F}" | cut -d' ' -f1)  ${F#${SCRIPT_DIR}/}"
+        done
+    } > "${OUT}"
+    echo "✓ Build record written to BUILD-INFO.txt"
+}
+
+# ─────────────────────────────────────────────────────────
+
+if [[ "${MODE}" == "clean" ]]; then
+    echo "Cleaning..."
+    rm -rf "${BUILD_DIR}" "${OUTPUT_DIR}/"*.xcframework
+    echo "✓ Clean"
+    exit 0
+fi
+
+# `package` mode skips fetch + compile and only re-runs the
+# framework + xcframework packaging steps using whatever's already
+# in build/thin and build/dav1d-thin. Useful when the only change
+# is to header-exclusion lists or framework Info.plist values, so
+# we don't burn a full multi-arch FFmpeg rebuild. Pass the same
+# linkage argument the compile ran with.
+if [[ "${MODE}" == "package" ]]; then
+    rm -rf "${BUILD_DIR}/frameworks" "${OUTPUT_DIR}/"*.xcframework 2>/dev/null || true
+    make_xcframeworks
+    write_build_info
+    echo ""
+    echo "✓ Repackage complete (${LINKAGE})"
+    exit 0
+fi
+
+patch_ffmpeg_mpegts_mpeg1_probe() {
+    # AetherEngine #641. mpegts_set_stream_info() takes most PMT stream types at their
+    # word, but asks for a content probe on two of them (request_probe = 50): 0x04
+    # (MPEG-2 audio) and 0x0f (AAC), because muxers are known to mislabel those. 0x03
+    # (MPEG-1 audio) is not on the list, so a PID that a restreamer labels 0x03 while
+    # it carries something else is opened as mp3 with no probe at all. The reporter's
+    # IPTV channel carries DTS-HD that way: every packet fails in mp3float ("Header
+    # missing") and the audio track never produces a frame. The same bytes labelled
+    # 0x04, 0x06, 0x0f or an unknown type all probe as DTS. Putting 0x03 on the list
+    # costs a genuine MPEG audio PID nothing: mp3 and mp2 both settle on the first
+    # PES packet, and a probe that finds nothing better keeps the PMT's codec.
+    # Proposed upstream as FFmpeg PR 24697.
+    local F="${FFMPEG_SRC}/libavformat/mpegts.c"
+    if grep -q "pes->stream_type == STREAM_TYPE_AUDIO_MPEG1 ||" "${F}"; then
+        return
+    fi
+    echo "→ Patching FFmpeg: probe the content of a PID labelled MPEG-1 audio (AetherEngine #641)"
+    perl -0777 -pi -e '
+s!    if \(pes->stream_type == STREAM_TYPE_AUDIO_MPEG2 \|\| pes->stream_type == STREAM_TYPE_AUDIO_AAC\)\n!    if (pes->stream_type == STREAM_TYPE_AUDIO_MPEG1 ||\n        pes->stream_type == STREAM_TYPE_AUDIO_MPEG2 ||\n        pes->stream_type == STREAM_TYPE_AUDIO_AAC)\n!;
+' "${F}"
+    if ! grep -q "pes->stream_type == STREAM_TYPE_AUDIO_MPEG1 ||" "${F}"; then
+        echo "ERROR: mpegts MPEG-1 audio probe patch did not apply (upstream source changed?)"
+        exit 1
+    fi
+}
+
+patch_ffmpeg_eac3_dec3() {
+    # AetherEngine #728. movenc's handle_eac3() builds the dec3 box from the first
+    # access unit, and gets two fields wrong once a dependent substream is involved.
+    # A Blu-ray style track (AC-3 core plus an E-AC-3 dependent frame carrying the
+    # height channels and the Atmos objects) then reads as a bare 5.1 bed: tvOS
+    # decodes the core and an Atmos receiver reports multichannel PCM.
+    #
+    # 1. chan_loc was derived from chanmap with a plain shift and a five-bit mask,
+    #    but chanmap is read MSB-first and chan_loc spans nine bits, so 5.1.2
+    #    (chanmap 0x0010 / 0xA010) came out as 0 instead of Lvh/Rvh (0x040). This is
+    #    upstream f10fdd6310, master only; the block is skipped once the pinned tag
+    #    carries it.
+    # 2. complexity_index_type_a (the ETSI TS 103 420 JOC extension) was taken from
+    #    the independent substream only, and re-read on every packet. With the
+    #    objects in the dependent frame it is 0 there, so the box lost the extension.
+    #    It is now taken from every substream of the access unit and kept at its
+    #    maximum, like data_rate. Proposed upstream as FFmpeg PR 24963.
+    local F="${FFMPEG_SRC}/libavformat/movenc.c"
+    if ! grep -q "(hdr->channel_map >> (10 - j)) & 1" "${F}"; then
+        echo "→ Patching FFmpeg: dec3 chan_loc from a dependent substream's chanmap (upstream f10fdd6310, AetherEngine #728)"
+        perl -0777 -pi -e '
+s#\Q                if (hdr->channel_map_present)
+                    info->substream[parent].chan_loc |= (hdr->channel_map >> 5) & 0x1f;
+                else
+                    info->substream[parent].chan_loc |= hdr->channel_mode;
+\E#                if (hdr->channel_map_present) {
+                    /* chanmap is a 16-bit field read MSB-first, so flag index
+                     * i sits at bit (15 - i). chan_loc bits 0-7 carry flag
+                     * indices 5-12, i.e. chanmap bit (10 - j); index 13
+                     * (Lts/Rts) has no chan_loc bit, and chan_loc bit 8 carries
+                     * LFE2, index 14, chanmap bit 1. */
+                    for (int j = 0; j < 8; j++) {
+                        if ((hdr->channel_map >> (10 - j)) & 1)
+                            info->substream[parent].chan_loc |= 1 << j;
+                    }
+                    if ((hdr->channel_map >> 1) & 1)
+                        info->substream[parent].chan_loc |= 1 << 8;
+                } else {
+                    info->substream[parent].chan_loc |= hdr->channel_mode;
+                }
+#;
+' "${F}"
+        if ! grep -q "(hdr->channel_map >> (10 - j)) & 1" "${F}"; then
+            echo "ERROR: dec3 chan_loc patch did not apply (upstream source changed?)"
+            exit 1
+        fi
+    fi
+    if grep -q "carried by a dependent substream" "${F}"; then
+        return
+    fi
+    echo "→ Patching FFmpeg: dec3 keeps the JOC extension of a dependent substream (AetherEngine #728)"
+    perl -0777 -pi -e '
+s#\Q    info->complexity_index_type_a = hdr->complexity_index_type_a;\E\n#    info->complexity_index_type_a = FFMAX(info->complexity_index_type_a,\n                                          hdr->complexity_index_type_a);\n#;
+s#(\n)(                cumul_size \+= hdr->frame_size;\n)#$1                /* the JOC extension may be carried by a dependent substream\n                 * only, e.g. an AC-3 core with the objects in an E-AC-3\n                 * dependent frame (ETSI TS 103 420) */\n                info->complexity_index_type_a = FFMAX(info->complexity_index_type_a,\n                                                      hdr->complexity_index_type_a);\n$2#;
+' "${F}"
+    if ! grep -q "carried by a dependent substream" "${F}" || \
+       [ "$(grep -c "info->complexity_index_type_a = FFMAX" "${F}")" != "2" ]; then
+        echo "ERROR: dec3 JOC extension patch did not apply (upstream source changed?)"
+        exit 1
+    fi
+}
+
+patch_ffmpeg_movenc_fragment_end() {
+    # StreamX crash 2026-10-10 (AetherEngine HLS segment pump). mov_flush_fragment()
+    # fills in a track's end from the first packet still waiting in the interleaver
+    # (ff_interleaved_peek). check_pkt() may already have moved the written samples
+    # past that packet's dts: the first sample of a fragment is placed at the previous
+    # fragment's declared end, and every later one that still sits below it is clamped
+    # to the sample before plus one. The track end then lies before its last sample,
+    # get_cluster_duration() sees a negative duration and av_assert0() aborts the
+    # process. A queued packet behind the last written sample says nothing about where
+    # the track ends, so it is skipped, and the end stays what the sample's own duration
+    # gave it. Proposed upstream as FFmpeg PR 25021.
+    local F="${FFMPEG_SRC}/libavformat/movenc.c"
+    if grep -q "cannot end the track before them" "${F}"; then
+        return
+    fi
+    echo "→ Patching FFmpeg: a queued packet behind the written samples does not end a fragment's track"
+    perl -0777 -pi -e '
+s#(                if \(track->dts_shift != AV_NOPTS_VALUE\)\n                    dts \+= track->dts_shift;\n)(                track->track_duration = dts - track->start_dts;\n)#$1                /* check_pkt() may have moved the written samples past this\n                 * packet; it cannot end the track before them. */\n                if (track->entry && dts < track->cluster[track->entry - 1].dts)\n                    continue;\n$2#;
+' "${F}"
+    if ! grep -q "cannot end the track before them" "${F}"; then
+        echo "ERROR: movenc fragment end patch did not apply (upstream source changed?)"
+        exit 1
+    fi
+}
+
+patch_ffmpeg_dca_x_heights() {
+    # DTS:X heights without LibDTSX (AetherEngine #798). The standard presentation of DTS:X
+    # carries its four height channels in a regular XLL channel set at the end of every XLL
+    # frame, which upstream recognises (it sets the "DTS-HD MA + DTS:X" profile) but skips.
+    # The patch decodes that set with the existing channel set code, adds a decoder option
+    # "x_heights" (off by default) that outputs 7.1.4, and removes the -3 dB fold of each
+    # height from the bed speaker under it. Without the option the output is unchanged
+    # byte for byte. It lives in patches/ rather than inline: at this size a perl
+    # substitution would be unreadable. The patch header explains the format.
+    local P="${SCRIPT_DIR}/patches/dca-xll-x-heights.patch"
+    if grep -q '"x_heights"' "${FFMPEG_SRC}/libavcodec/dcadec.c"; then
+        return
+    fi
+    echo "→ Patching FFmpeg: decode the DTS:X standard presentation's height channels (AetherEngine #798)"
+    git -C "${FFMPEG_SRC}" apply "${P}" || {
+        echo "ERROR: DTS:X height patch did not apply (upstream source changed?)"
+        exit 1
+    }
+}
+
+patch_ffmpeg_av1_delayed_rap() {
+    # AetherEngine #931 (FFmpeg PR 25607). A forward key frame encode opens each GOP with a
+    # Temporal Unit holding a Sequence Header and a HIDDEN Key Frame (show_frame = 0). When
+    # that frame refreshes all eight reference slots, decoding can start right there, but
+    # upstream calls it an inter frame twice: av1_parser only reports a shown Key Frame,
+    # and for Matroska video that verdict replaces the block flag; muxers leave the flag
+    # off too, so matroskadec builds no index and every seek fails. The reporting file
+    # reached the engine without a single keyframe. The patch adds
+    # ff_av1_is_random_access_point() (reads the frame header up to refresh_frame_flags),
+    # and both matroskadec and av1_parser use the full-refresh case. libaom's forward key
+    # frames refresh one slot and stay inter frames. It lives in patches/ because it spans
+    # five files.
+    local P="${SCRIPT_DIR}/patches/av1-delayed-rap.patch"
+    if grep -q "ff_av1_is_random_access_point" "${FFMPEG_SRC}/libavformat/av1.h"; then
+        return
+    fi
+    echo "→ Patching FFmpeg: AV1 full-refresh Delayed Random Access Points are keyframes (AetherEngine #931)"
+    git -C "${FFMPEG_SRC}" apply "${P}" || {
+        echo "ERROR: AV1 delayed random access patch did not apply (upstream source changed?)"
+        exit 1
+    }
+}
+
+echo "╔══════════════════════════════════════╗"
+echo "║  FFmpegBuild: FFmpeg + dav1d (AV1)  ║"
+echo "║  VideoToolbox HW + Metal ready      ║"
+echo "║  Linkage: ${LINKAGE}                     ║"
+echo "╚══════════════════════════════════════╝"
+
+fetch_ffmpeg
+patch_ffmpeg
+patch_ffmpeg_pgssub
+patch_ffmpeg_visionos
+patch_ffmpeg_matroska_tts
+patch_ffmpeg_vc1_parser
+patch_ffmpeg_dav1_tag
+patch_ffmpeg_mpegts_mpeg1_probe
+patch_ffmpeg_eac3_dec3
+patch_ffmpeg_movenc_fragment_end
+patch_ffmpeg_dca_x_heights
+patch_ffmpeg_av1_delayed_rap
+fetch_dav1d
+fetch_zimg
+fetch_zvbi
+patch_zvbi
+record_build_inputs
+
+# Build dav1d for all platforms first
+build_dav1d_one ios-arm64          iphoneos         arm64  arm64-apple-ios16.0                    16.0
+build_dav1d_one isimulator-arm64   iphonesimulator  arm64  arm64-apple-ios16.0-simulator          16.0
+build_dav1d_one isimulator-x86_64  iphonesimulator  x86_64 x86_64-apple-ios16.0-simulator         16.0
+build_dav1d_one tvos-arm64         appletvos        arm64  arm64-apple-tvos16.0                   16.0
+build_dav1d_one tvsimulator-arm64  appletvsimulator arm64  arm64-apple-tvos16.0-simulator         16.0
+build_dav1d_one tvsimulator-x86_64 appletvsimulator x86_64 x86_64-apple-tvos16.0-simulator        16.0
+build_dav1d_one xros-arm64         xros             arm64  arm64-apple-xros1.0                    1.0
+build_dav1d_one xrsimulator-arm64  xrsimulator      arm64  arm64-apple-xros1.0-simulator          1.0
+build_dav1d_one macos-arm64        macosx           arm64  arm64-apple-macos14.0                  14.0
+build_dav1d_one macos-x86_64       macosx           x86_64 x86_64-apple-macos14.0                 14.0
+
+# Build zimg for all platforms (FFmpeg's configure must find it)
+build_zimg_one ios-arm64          iphoneos         arm64  arm64-apple-ios16.0                    16.0
+build_zimg_one isimulator-arm64   iphonesimulator  arm64  arm64-apple-ios16.0-simulator          16.0
+build_zimg_one isimulator-x86_64  iphonesimulator  x86_64 x86_64-apple-ios16.0-simulator         16.0
+build_zimg_one tvos-arm64         appletvos        arm64  arm64-apple-tvos16.0                   16.0
+build_zimg_one tvsimulator-arm64  appletvsimulator arm64  arm64-apple-tvos16.0-simulator         16.0
+build_zimg_one tvsimulator-x86_64 appletvsimulator x86_64 x86_64-apple-tvos16.0-simulator        16.0
+build_zimg_one xros-arm64         xros             arm64  arm64-apple-xros1.0                    1.0
+build_zimg_one xrsimulator-arm64  xrsimulator      arm64  arm64-apple-xros1.0-simulator          1.0
+build_zimg_one macos-arm64        macosx           arm64  arm64-apple-macos14.0                  14.0
+build_zimg_one macos-x86_64       macosx           x86_64 x86_64-apple-macos14.0                 14.0
+
+# Build libzvbi for all platforms (FFmpeg's configure must find it for the teletext decoder)
+build_zvbi_one ios-arm64          iphoneos         arm64  arm64-apple-ios16.0                    16.0
+build_zvbi_one isimulator-arm64   iphonesimulator  arm64  arm64-apple-ios16.0-simulator          16.0
+build_zvbi_one isimulator-x86_64  iphonesimulator  x86_64 x86_64-apple-ios16.0-simulator         16.0
+build_zvbi_one tvos-arm64         appletvos        arm64  arm64-apple-tvos16.0                   16.0
+build_zvbi_one tvsimulator-arm64  appletvsimulator arm64  arm64-apple-tvos16.0-simulator         16.0
+build_zvbi_one tvsimulator-x86_64 appletvsimulator x86_64 x86_64-apple-tvos16.0-simulator        16.0
+build_zvbi_one xros-arm64         xros             arm64  arm64-apple-xros1.0                    1.0
+build_zvbi_one xrsimulator-arm64  xrsimulator      arm64  arm64-apple-xros1.0-simulator          1.0
+build_zvbi_one macos-arm64        macosx           arm64  arm64-apple-macos14.0                  14.0
+build_zvbi_one macos-x86_64       macosx           x86_64 x86_64-apple-macos14.0                 14.0
+
+# Build FFmpeg (links against dav1d)
+build_one ios-arm64          iphoneos         arm64  arm64-apple-ios16.0                    16.0
+build_one isimulator-arm64   iphonesimulator  arm64  arm64-apple-ios16.0-simulator          16.0
+build_one isimulator-x86_64  iphonesimulator  x86_64 x86_64-apple-ios16.0-simulator         16.0
+build_one tvos-arm64         appletvos        arm64  arm64-apple-tvos16.0                   16.0
+build_one tvsimulator-arm64  appletvsimulator arm64  arm64-apple-tvos16.0-simulator         16.0
+build_one tvsimulator-x86_64 appletvsimulator x86_64 x86_64-apple-tvos16.0-simulator        16.0
+build_one xros-arm64         xros             arm64  arm64-apple-xros1.0                    1.0
+build_one xrsimulator-arm64  xrsimulator      arm64  arm64-apple-xros1.0-simulator          1.0
+build_one macos-arm64        macosx           arm64  arm64-apple-macos14.0                  14.0
+build_one macos-x86_64       macosx           x86_64 x86_64-apple-macos14.0                 14.0
+
+make_xcframeworks
+write_build_info
+
+echo ""
+echo "╔══════════════════════════════════════╗"
+echo "║  ✓ Build complete!                   ║"
+echo "╚══════════════════════════════════════╝"
+echo ""
+echo "Sizes:"
+for xcf in "${OUTPUT_DIR}"/*.xcframework; do
+    [[ -d "$xcf" ]] && echo "  $(du -sh "$xcf" | cut -f1)  $(basename $xcf)"
+done

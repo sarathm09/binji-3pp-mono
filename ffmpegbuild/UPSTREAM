@@ -1,0 +1,5 @@
+repository: https://github.com/superuser404notfound/FFmpegBuild
+tag: 3.11.1
+commit: 6b5d084664234649c258248d16111dbac64684be
+synced: 2026-11-04T03:25:00Z
+binaries: not mirrored; prebuilt frameworks ship from the upstream tag above

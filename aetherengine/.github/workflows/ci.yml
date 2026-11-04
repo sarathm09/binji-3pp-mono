@@ -1,0 +1,200 @@
+name: CI
+
+# The gate every push and PR waits for: the tests on macOS with and without the optional components,
+# and the test target for the two simulator SDKs, as four parallel jobs. Everything that only builds
+# a further configuration (Release aetherctl, the device SDKs with every component, visionOS, the
+# probes) runs in `ci-extended.yml`, nightly and by hand before a release tag. The single macOS job
+# that ran all of this in sequence took ~21 minutes per change; this split is ~10.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# A PR gets its newest commit tested, so a push supersedes the run before it. On main every commit
+# keeps its run: cancelling a merge's run when the next push lands left 27 of 100 runs cancelled and a
+# red one that could not be traced back to the commit that caused it.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  # One toolchain: GitHub's `xcode-27` image (macOS 27.0, default Xcode 27.0 27A266a), the same
+  # Xcode the engine is consumed and released from. The earlier macos-15 lanes resolved
+  # `latest-stable` to Xcode 26.3, whose Swift 6.2 disagreed with 6.4 in both directions (6.4
+  # rejects isolation shapes 6.3 accepted, 2026-09-16; 6.2 timed out type-checking a literal sum
+  # inside #expect, 2026-09-30), and nothing downstream builds with 26.x any more, so the README's
+  # requirement is Xcode 27 and CI tests exactly that. `xcode-27` is still a GitHub preview image.
+  # Its flaky `swift test` runs of mid-September were on a beta macOS 27 base with Xcode 27
+  # beta 6; the image moved to macOS 27 on 2026-09-16. If it turns unstable again, that shows as
+  # a lane red for its image, which is the signal to wait for the GA label, not to lower the bar.
+  # The four macOS jobs stay within the account's five concurrent macOS runners.
+  test-macos:
+    name: swift test (macOS)
+    runs-on: xcode-27
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # SwiftPM's shared clone cache. Fetching FFmpegBuild alone took ~45 s per job; a cached clone
+      # only fetches what changed. A miss or a failed restore costs nothing but that fetch.
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/Library/Caches/org.swift.swiftpm/repositories
+          key: swiftpm-repos-${{ hashFiles('Package.resolved') }}
+          restore-keys: swiftpm-repos-
+
+      - name: Show toolchain
+        run: |
+          swift --version
+          xcodebuild -version
+
+      - name: swift build --build-tests
+        run: swift build --build-tests
+
+      # A test process that dies mid-run reads as exit 1 with no ✘, no backtrace and no swift-testing
+      # summary: `swift test` collapses every abnormal child exit to a plain 1, and a signal takes the
+      # buffered tail of the event stream with it. What was in flight is whatever the log still lists
+      # as started but never finished. Three such deaths were an unguarded socket write raising
+      # SIGPIPE from a test origin server (see the SO_NOSIGPIPE note in Issue177IngestPrefetchTests),
+      # so nothing hangs and no time limit would have caught it.
+      #
+      # `swift test` runs XCTest and then Swift Testing, and the Swift Testing summary line says
+      # nothing about the XCTest half: a red XCTest case leaves that line green and the step exits 1.
+      # `grep "error: -\["` finds the XCTest failure.
+      - name: swift test
+        run: swift test --skip-build
+
+      # The same Swift Testing suite on a ONE-thread cooperative pool. Anything that blocks a pool
+      # thread (a sync read, a semaphore, a `Task.detached` around engine I/O) starves every other
+      # test here deterministically, instead of a different victim timing out on some later run of
+      # the 3-core runner. See docs/architecture.md, "Blocking work and the cooperative pool".
+      - name: swift test (one-thread cooperative pool)
+        env:
+          LIBDISPATCH_COOPERATIVE_POOL_STRICT: "1"
+        run: swift test --skip-build --disable-xctest
+
+      # Standalone swiftc builds. They link FFmpegBuild out of `.build/checkouts`, so they ride in the
+      # job that resolved it. Each script compiles a hand-picked file list, so a new reference in a
+      # file under test breaks it: add the real file to the list, never a stub (a build with shims
+      # compiles a different file).
+      - name: Software VOD packet-cache regressions
+        run: |
+          bash Scripts/test-software-packet-coverage.sh
+          bash Scripts/test-software-video-packet-coverage.sh
+          bash Scripts/test-software-packet-disk-fifo.sh
+          bash Scripts/test-software-packet-read-ahead.sh
+          bash Scripts/test-software-read-admission.sh
+          bash Scripts/test-software-stored-packet.sh
+
+      - name: Partial H.264 composition-offset runtime regression
+        run: |
+          command -v ffmpeg >/dev/null || brew install ffmpeg
+          bash Scripts/test-h264-partial-composition-controls.sh
+
+  # The optional components (TrueHDObjectAudio, DTSXObjectAudio, DualLayerDolbyVision) are off by
+  # default, so the job above builds and tests without them. This one keeps the opt-in code compiling
+  # and its tests running, in parallel instead of after the default run.
+  test-macos-all-traits:
+    name: swift test (macOS, all traits)
+    runs-on: xcode-27
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/Library/Caches/org.swift.swiftpm/repositories
+          key: swiftpm-repos-${{ hashFiles('Package.resolved') }}
+          restore-keys: swiftpm-repos-
+
+      - name: swift build --build-tests (all traits)
+        run: swift build --enable-all-traits --build-tests
+
+      - name: swift test (all traits)
+        run: swift test --enable-all-traits --skip-build
+
+      - name: swift test (all traits, one-thread cooperative pool)
+        env:
+          LIBDISPATCH_COOPERATIVE_POOL_STRICT: "1"
+        run: swift test --enable-all-traits --skip-build --disable-xctest
+
+  build-tvos:
+    name: xcodebuild (tvOS Simulator)
+    runs-on: xcode-27
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/Library/Caches/org.swift.swiftpm/repositories
+          key: swiftpm-repos-${{ hashFiles('Package.resolved') }}
+          restore-keys: swiftpm-repos-
+
+      # The test target is the only place a platform gate in TEST code is ever checked. `swift test`
+      # on macOS compiles the macOS side of every `#if`, so a gate put around a helper instead of
+      # around the tests that call it looks complete there and costs nothing until someone builds
+      # for a simulator. That is how `AetherEngineTests` stopped compiling for iOS and tvOS without
+      # a single red run (2026-09-14, HLSOriginRelayTests).
+      #
+      # EXCLUDED_ARCHS because a generic simulator destination builds both slices and `libdovi.a`
+      # ships arm64 only, so the x86_64 link fails and says nothing about this repo.
+      #
+      # This step also compiles the library, so no separate `xcodebuild build` of the AetherEngine
+      # scheme runs first: that doubled every simulator job's compile, and the x86_64 slice it added
+      # is one no app can link anyway.
+      - name: Build the tests for tvOS Simulator
+        run: |
+          xcodebuild build-for-testing \
+            -scheme AetherEngineTests \
+            -destination 'generic/platform=tvOS Simulator' \
+            -derivedDataPath .build/xcode-tvos \
+            EXCLUDED_ARCHS=x86_64 \
+            CODE_SIGNING_ALLOWED=NO
+
+  build-ios:
+    name: xcodebuild (iOS Simulator)
+    runs-on: xcode-27
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/Library/Caches/org.swift.swiftpm/repositories
+          key: swiftpm-repos-${{ hashFiles('Package.resolved') }}
+          restore-keys: swiftpm-repos-
+
+      # The other half of the gate check above; see the tvOS job for why the test target needs its
+      # own build and why x86_64 is excluded.
+      - name: Build the tests for iOS Simulator
+        run: |
+          xcodebuild build-for-testing \
+            -scheme AetherEngineTests \
+            -destination 'generic/platform=iOS Simulator' \
+            -derivedDataPath .build/xcode-ios \
+            EXCLUDED_ARCHS=x86_64 \
+            CODE_SIGNING_ALLOWED=NO
+
+  # The docs site (aetherengine-website) validates every heading anchor at build time, but it
+  # lives in another repo and only builds AFTER a push to main, so a broken anchor ships first
+  # and is found second: `docs/api.md` linked `formats.md#dolby-vision` against a heading that
+  # slugs to `#dolby-vision-signaling`, and the site build failed on every dispatch from 6.58.0
+  # until someone looked. Same check, here, before the merge. Ubuntu on purpose: it needs no
+  # toolchain and no network, so it reports in seconds while the macOS jobs are still starting.
+  docs-links:
+    name: docs links
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Validate relative links and heading anchors in the published docs
+        run: python3 Scripts/check-doc-links.py
+
+      # The two waiting rules in CONTRIBUTING.md that a grep can check, each written after a red main
+      # (a 30 minute hang with its log discarded, and rounds of starved waiters).
+      - name: Test hygiene (no swallowed cancellation, no parked work on the global pool)
+        run: python3 Scripts/check-test-hygiene.py
