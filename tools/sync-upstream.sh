@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-usage() { echo "usage: tools/sync-upstream.sh <aetherengine|ffmpegbuild> <tag>" >&2; exit 64; }
+usage() { echo "usage: tools/sync-upstream.sh <aetherengine|ffmpegbuild|smbclient> <tag>" >&2; exit 64; }
 [[ $# -eq 2 ]] || usage
 
+skip=()
 case "$1" in
   aetherengine) repo="superuser404notfound/AetherEngine" ;;
   ffmpegbuild)  repo="superuser404notfound/FFmpegBuild" ;;
+  smbclient)    repo="kishikawakatsumi/SMBClient"; skip=(--exclude 'Tests/SMBClientTests/Fixtures') ;;
   *) usage ;;
 esac
 dir="$1"
@@ -21,7 +23,7 @@ commit="$(gh api "repos/$repo/commits/$tag" --jq .sha)"
 gh api "repos/$repo/tarball/$commit" > "$work/src.tar.gz"
 mkdir "$work/src"
 tar -xzf "$work/src.tar.gz" -C "$work/src" --strip-components 1 \
-  --exclude '*.xcframework' --exclude '*.zip' --exclude '*.a' --exclude '*.dylib'
+  --exclude '*.xcframework' --exclude '*.zip' --exclude '*.a' --exclude '*.dylib' ${skip[@]+"${skip[@]}"}
 
 mkdir -p "$root/$dir"
 rsync -a --delete --exclude UPSTREAM "$work/src/" "$root/$dir/"
