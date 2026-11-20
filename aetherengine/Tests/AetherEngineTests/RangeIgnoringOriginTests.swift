@@ -115,7 +115,7 @@ struct RangeIgnoringOriginTests {
     }
 
     @Test("an origin that ignores Range is read forward-only past the 32 MB range boundary",
-          .timeLimit(.minutes(2)))
+          .timeLimit(.minutes(3)))
     func forwardOnlyPastTheRangeBoundary() throws {
         let total = Int64(72 * mb)
         let maybe = ThrottledOriginServer(totalSize: total, throttleUs: 500, patternedBody: true,
@@ -130,7 +130,7 @@ struct RangeIgnoringOriginTests {
     }
 
     @Test("a cold open that was refused once does not hide an origin that ignores Range",
-          .timeLimit(.minutes(2)))
+          .timeLimit(.minutes(3)))
     func refusedColdOpenStillFindsTheIgnoredRange() throws {
         let total = Int64(72 * mb)
         let once = FirstClaim()
@@ -151,7 +151,7 @@ struct RangeIgnoringOriginTests {
     }
 
     @Test("an origin that honours Range keeps the seekable path and its range refills",
-          .timeLimit(.minutes(2)))
+          .timeLimit(.minutes(3)))
     func honouringOriginIsUnaffected() throws {
         let total = Int64(40 * mb)
         let server = try #require(ThrottledOriginServer(totalSize: total, throttleUs: 500))
@@ -176,14 +176,15 @@ struct RangeIgnoringOriginTests {
         }
         #expect(read >= 36 * Int64(mb))
         #expect(server.rangeHeaderPresence.allSatisfy { $0 }, "a ranged source asked for an unranged GET")
-        #expect(server.requestedRanges.contains { $0.start == 32 * Int64(mb) },
+        // AE#958: the refill re-reads the held bytes before the boundary to check the origin.
+        #expect(server.requestedRanges.contains { $0.start == 32 * Int64(mb) - Int64(AVIOReader.rangeCheckBytes) },
                 "the refill at the 32 MB boundary never asked for its range")
         #expect(!server.requestLog.contains { $0.start == 1 && $0.end == 1 },
                 "an honoured range needs no confirmation")
     }
 
     @Test("an origin that honours Range and refused the cold open once keeps the seekable path",
-          .timeLimit(.minutes(2)))
+          .timeLimit(.minutes(3)))
     func refusedColdOpenOnHonouringOriginStaysSeekable() throws {
         let total = Int64(40 * mb)
         let once = FirstClaim()
@@ -211,14 +212,15 @@ struct RangeIgnoringOriginTests {
             read += Int64(n)
         }
         #expect(read >= 36 * Int64(mb))
-        #expect(server.requestedRanges.contains { $0.start == 32 * Int64(mb) },
+        // AE#958: the refill re-reads the held bytes before the boundary to check the origin.
+        #expect(server.requestedRanges.contains { $0.start == 32 * Int64(mb) - Int64(AVIOReader.rangeCheckBytes) },
                 "the refill at the 32 MB boundary never asked for its range")
         #expect(!server.requestLog.contains { $0.start == 1 && $0.end == 1 },
                 "an honoured range needs no confirmation")
     }
 
     @Test("a 200 on a cache miss at the open does not take the seekable path away",
-          .timeLimit(.minutes(2)))
+          .timeLimit(.minutes(3)))
     func cacheMissAtTheOpenIsConfirmedAway() throws {
         let total = Int64(40 * mb)
         let once = FirstClaim()

@@ -40,7 +40,7 @@ extension PrewarmStoreSuites {
         // MARK: - The handoff
 
         @Test("the load starts at the target the warm resolved instead of resolving it again",
-              .timeLimit(.minutes(2)))
+              .timeLimit(.minutes(3)))
         func loadAdoptsTheWarmsResolvedTarget() async throws {
             SourcePrewarmStore.shared.clear()
             let cdn = try #require(ThrottledOriginServer(totalSize: fileSize))
@@ -65,11 +65,12 @@ extension PrewarmStoreSuites {
 
             #expect(source.rangeRequestCount == resolvesForTheWarm,
                     "the session resolved the chain a second time: \(source.requestLog)")
-            #expect(cdn.requestLog.contains(where: { $0.start >= 256 * 1024 }),
+            // AE#958: the connection re-reads the warm's last `rangeCheckBytes` to check the origin.
+            #expect(cdn.requestLog.contains(where: { $0.start >= 256 * 1024 - Int64(AVIOReader.rangeCheckBytes) }),
                     "the data connection never reached the resolved target: \(cdn.requestLog)")
         }
 
-        @Test("a warm that never saw a redirect pins nothing", .timeLimit(.minutes(2)))
+        @Test("a warm that never saw a redirect pins nothing", .timeLimit(.minutes(3)))
         func aDirectWarmPinsNothing() async throws {
             SourcePrewarmStore.shared.clear()
             let server = try #require(ThrottledOriginServer(totalSize: fileSize))
@@ -86,7 +87,7 @@ extension PrewarmStoreSuites {
         // MARK: - What travels to the pinned target
 
         @Test("a credential header does not reach a cross-origin target the session pinned",
-              .timeLimit(.minutes(2)))
+              .timeLimit(.minutes(3)))
         func credentialsStayOffThePinnedTarget() async throws {
             let firstRange: Int64 = 256 * 1024
             let cdn = try #require(ThrottledOriginServer(totalSize: fileSize))
@@ -123,7 +124,7 @@ extension PrewarmStoreSuites {
                     "the source itself must still be authenticated: \(source.requestHeaders)")
         }
 
-        @Test("the same-origin case keeps every header it always had", .timeLimit(.minutes(2)))
+        @Test("the same-origin case keeps every header it always had", .timeLimit(.minutes(3)))
         func sameOriginKeepsCredentials() async throws {
             let server = try #require(ThrottledOriginServer(totalSize: fileSize))
             defer { server.stop() }

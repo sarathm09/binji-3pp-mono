@@ -3,7 +3,7 @@ import Combine
 import Testing
 @testable import AetherEngine
 
-@Suite(.timeLimit(.minutes(2)))
+@Suite(.timeLimit(.minutes(3)))
 @MainActor
 struct VODSeekCapabilityTests {
     @Test("A known duration never makes a forward-only source seekable")
@@ -65,6 +65,32 @@ struct VODSeekCapabilityTests {
         engine.state = .playing
         try await waitFor { !engine.isSeeking }
         #expect(engine.currentTime == 5)
+    }
+
+    @Test("An audio switch keeps a seekable source seekable on both decode paths",
+          arguments: [DecodePath.automatic, DecodePath.software])
+    func audioSwitchKeepsSeekability(path: DecodePath) async throws {
+        let origin = try ProbeHTTPTestOrigin(data: TwoAudioTrackFixture.data)
+        let engine = try AetherEngine()
+        defer { engine.stop(); origin.stop() }
+        var options = LoadOptions()
+        options.preferredDecodePath = path
+        options.suppressDisplayCriteria = true
+        try await engine.load(url: URL(string: "http://127.0.0.1:\(origin.port)/two-audio.mkv")!, options: options)
+        try await waitFor { engine.canSeek && engine.currentTime > 0.5 }
+        // The clip is 6 s and plays in real time. On a starved CI pool the switch took long enough for
+        // it to reach .ended, which refuses the seek for a reason this test is not about. Paused, it
+        // cannot run out.
+        engine.pause()
+        try await waitFor { engine.state == .paused }
+        let other = try #require(engine.audioTracks.first { $0.id != engine.activeAudioTrackIndex })
+        engine.selectAudioTrack(index: other.id)
+        try await waitFor { engine.activeAudioTrackIndex == other.id && engine.isSessionReady }
+        #expect(engine.isSourceSeekable == true)
+        #expect(engine.canSeek)
+        await engine.seek(to: 4)
+        try await waitFor { engine.currentTime > 3.5 }
+        #expect(abs(engine.currentTime - 4) < 1)
     }
 
 

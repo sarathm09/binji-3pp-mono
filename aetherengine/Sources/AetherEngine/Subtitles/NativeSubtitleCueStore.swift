@@ -27,7 +27,36 @@ final class NativeSubtitleCueStore: @unchecked Sendable {
     /// with different positions share the store.
     private var maxCueEndSeconds: Double = 0
 
-    init() {}
+    /// AE#1052: a bitmap rendition has no tap or reader behind it. Only the OCR worker or a sidecar
+    /// fill puts cues in, and only while one of them runs on this store.
+    let fillsOnDemand: Bool
+    private var runningFills = 0
+
+    init(fillsOnDemand: Bool = false) { self.fillsOnDemand = fillsOnDemand }
+
+    func fillStarted() { lock.lock(); runningFills += 1; lock.unlock() }
+    func fillEnded() { lock.lock(); runningFills = max(0, runningFills - 1); lock.unlock() }
+
+    /// Whether a request for this store is worth holding for cues. A bitmap store nothing fills would
+    /// hold every request for the whole readiness wait and hand back nothing anyway; on tvOS that held
+    /// the loopback connection AVPlayer also loads video on, and a seek never landed.
+    var waitsForFill: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return !fillsOnDemand || runningFills > 0
+    }
+
+    /// Set once the first request found nothing filling the store, so the log says it once.
+    func noteServedWithoutFill() -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        if notedWithoutFill { return false }
+        notedWithoutFill = true
+        return true
+    }
+    private var notedWithoutFill = false
+
+    /// An empty segment from this store is expected rather than a lost race: a menu marker, or a
+    /// bitmap store nothing fills. The server keeps its empty-segment warning for the other case.
+    var servesEmptyByDesign: Bool { servesSilently || !waitsForFill }
 
     private static func key(start: Double, end: Double, text: String) -> String {
         let start = SourceTimestampBounds.clampedSeconds(start), end = SourceTimestampBounds.clampedSeconds(end)
@@ -37,8 +66,58 @@ final class NativeSubtitleCueStore: @unchecked Sendable {
     func setShiftSeconds(_ s: Double) { lock.lock(); shiftSeconds = s; lock.unlock() }
 
     /// Set once the reader has read the track to EOF, so a whole-program .vtt consumer knows every cue is present (Sodalite#32).
-    func markFinished() { lock.lock(); finished = true; lock.unlock() }
+    func markFinished() { lock.lock(); finished = true; externalFill = .none; lock.unlock() }
     var isFinished: Bool { lock.lock(); defer { lock.unlock() }; return finished }
+
+    /// AE#1052: the rendition is a menu marker, so the server answers with no cues while the store
+    /// keeps filling (or keeps what an earlier PiP fill left) for the next time it is the display.
+    var servesSilently: Bool {
+        get { lock.lock(); defer { lock.unlock() }; return silent }
+        set { lock.lock(); silent = newValue; lock.unlock() }
+    }
+    private var silent = false
+
+    /// AE#984: where a load-declared sidecar's whole-file fill stands. Only that fill sets it; a store
+    /// fed by the pump tap or a side reader stays `.none` and keeps its own readiness rules.
+    enum ExternalFill: Equatable, Sendable {
+        case none
+        /// The decode is running: a whole-program `.vtt` is answered "not yet" (404) so AVPlayer
+        /// asks again, instead of holding the request, which stalls its media loading as well.
+        case pending
+        /// The decode gave up: the `.vtt` is served as it stands (empty), at once, so a selected
+        /// rendition never strands the A/V session.
+        case failed
+    }
+    private var externalFill: ExternalFill = .none
+
+    func markExternalFillPending() {
+        lock.lock(); if !finished { externalFill = .pending }; lock.unlock()
+    }
+    func markExternalFillFailed() {
+        lock.lock(); if !finished { externalFill = .failed }; lock.unlock()
+    }
+    var externalFillState: ExternalFill { lock.lock(); defer { lock.unlock() }; return externalFill }
+
+    /// AE#984: what a whole-program `.vtt` request gets from this store right now.
+    enum WholeProgramServe: Equatable, Sendable {
+        /// Every cue is in: serve the file.
+        case complete
+        /// A sidecar fill is still running: answer 404 at once, AVPlayer retries the segment.
+        case retryLater
+        /// A sidecar fill failed: serve what there is (nothing) at once.
+        case failedFill
+        /// No sidecar fill involved: the caller's own bounded wait applies.
+        case waitForReader
+    }
+    var wholeProgramServe: WholeProgramServe {
+        lock.lock(); defer { lock.unlock() }
+        if finished { return .complete }
+        switch externalFill {
+        case .pending: return .retryLater
+        case .failed: return .failedFill
+        case .none: return .waitForReader
+        }
+    }
 
     func replaceCues(_ newCues: [SubtitleCue]) {
         lock.lock(); defer { lock.unlock() }

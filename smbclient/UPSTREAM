@@ -1,0 +1,5 @@
+repository: https://github.com/kishikawakatsumi/SMBClient
+tag: 0.3.1
+commit: e636c2b2458930770932a36d311ec9d478575b90
+synced: 2026-11-05T05:24:30Z
+binaries: not mirrored; prebuilt frameworks ship from the upstream tag above

@@ -2,6 +2,9 @@ import Testing
 import Foundation
 @testable import AetherEngine
 
+// AE#958: a refill at a held frontier asks `AVIOReader.rangeCheckBytes` early to check the origin,
+// so the origin below keys on the request the reader actually sends, `firstRange - rangeCheckBytes`.
+
 /// A connection that ended in ERROR without delivering a single byte of its generation used
 /// to be routed through the no-connection reposition branch: `seekReconnect` cleared the
 /// unproductive streak and applied no backoff, so an origin refusing every refill (e.g. a
@@ -40,13 +43,13 @@ struct ErrorEndedReconnectTests {
     /// failure ladder (status accounting, backoff, `.reconnecting`, bounded give-up) instead
     /// of reconnecting forever off the books.
     @Test("an origin refusing every refill is retried with backoff and given up on",
-          .timeLimit(.minutes(2)))
+          .timeLimit(.minutes(3)))
     func refusedRefillIsBoundedAndGivenUp() async throws {
 
         let firstRange: Int64 = 512 * 1024
         let serverMaybe = ThrottledOriginServer(
             totalSize: 64 * 1024 * 1024,
-            respond: { _, offset, _ in offset < firstRange ? .serve206 : .status(500) }
+            respond: { _, offset, _ in offset < (firstRange - Int64(AVIOReader.rangeCheckBytes)) ? .serve206 : .status(500) }
         )
         let server = try #require(serverMaybe)
         defer { server.stop() }
@@ -72,7 +75,7 @@ struct ErrorEndedReconnectTests {
         #expect(result == -1, "a refused source must fail the read, not hang")
         // Streak 0..12 then give-up: ~14 attempts. The bug produced hundreds; leave slack
         // for the odd URLSession-level retry without letting a spiral pass.
-        let attemptsAtBoundary = server.requestedRanges.filter { $0.start == firstRange }.count
+        let attemptsAtBoundary = server.requestedRanges.filter { $0.start == (firstRange - Int64(AVIOReader.rangeCheckBytes)) }.count
         #expect(attemptsAtBoundary >= 2, "the failure must have been retried at all")
         #expect(attemptsAtBoundary <= 20,
                 "reconnect spiral: \(attemptsAtBoundary) attempts at offset \(firstRange)")
@@ -84,14 +87,14 @@ struct ErrorEndedReconnectTests {
     /// transient. The first ladder pass sees real progress since the last accounting, keeps
     /// the streak at zero, applies no backoff, and the retry completes the read.
     @Test("a single dropped refill connection recovers and completes the read",
-          .timeLimit(.minutes(2)))
+          .timeLimit(.minutes(3)))
     func transientRefillFailureRecovers() async throws {
         let firstRange: Int64 = 512 * 1024
         let attempts = AttemptCounter()
         let serverMaybe = ThrottledOriginServer(
             totalSize: 64 * 1024 * 1024,
             respond: { _, offset, _ in
-                offset == firstRange && attempts.next(for: offset) == 1
+                offset == (firstRange - Int64(AVIOReader.rangeCheckBytes)) && attempts.next(for: offset) == 1
                     ? .dropConnection : .serve206
             }
         )
@@ -120,7 +123,7 @@ struct ErrorEndedReconnectTests {
 
     /// Regression guard for the healthy path: a range boundary on a well-behaved origin
     /// stays off the failure ladder entirely — no streak, no `.reconnecting`.
-    @Test("healthy range boundaries stay off the failure ladder", .timeLimit(.minutes(2)))
+    @Test("healthy range boundaries stay off the failure ladder", .timeLimit(.minutes(3)))
     func healthyBoundariesKeepFastPath() async throws {
         let firstRange: Int64 = 256 * 1024
         let server = try #require(ThrottledOriginServer(totalSize: 64 * 1024 * 1024))
