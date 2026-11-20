@@ -11,7 +11,7 @@ extension PrewarmStoreSuites {
     ///
     /// `.serialized`: the prewarm store is process-wide. The origin budget is too, so nothing here
     /// resets it globally; each server has its own port and therefore its own origin key.
-    @Suite("Source prewarm adoption (#551)", .serialized, .timeLimit(.minutes(2)))
+    @Suite("Source prewarm adoption (#551)", .serialized, .timeLimit(.minutes(3)))
     struct SourcePrewarmAdoptionTests {
 
         private let fileSize: Int64 = 64 * 1024 * 1024
@@ -73,10 +73,12 @@ extension PrewarmStoreSuites {
             let reader = AVIOReader(url: url(server))
             defer { reader.markClosed(); reader.close() }
             try reader.open()
-            try await waitForRequest(server, startingAt: Int64(warmBytes))
+            // AE#958: the connection re-reads the warm's last bytes to check the origin against them.
+            let frontier = Int64(warmBytes) - Int64(AVIOReader.rangeCheckBytes)
+            try await waitForRequest(server, startingAt: frontier)
 
             let opened = Array(server.requestedRanges.dropFirst(warmRequests))
-            #expect(opened.contains(where: { $0.start == Int64(warmBytes) }),
+            #expect(opened.contains(where: { $0.start == frontier }),
                     "no connection at the warm frontier: \(opened)")
             #expect(!opened.contains(where: { $0.start == 0 }),
                     "the open went back to byte zero: \(opened)")

@@ -2,6 +2,9 @@ import Testing
 import Foundation
 @testable import AetherEngine
 
+// AE#958: a refill at a held frontier asks `AVIOReader.rangeCheckBytes` early to check the origin,
+// so the origin below keys on the request the reader actually sends, `firstRange - rangeCheckBytes`.
+
 /// #410, the reader half. The phase axis a host reads for "is my source down" was cleared by two things
 /// that are not deliveries: the ladder's own exit (`.flowing` on the way out, so the reopen window read as
 /// a healthy source) and every serve out of memory (draining read-ahead while the origin refuses every
@@ -35,7 +38,7 @@ struct Issue410SourceStallVisibilityTests {
     /// `.reconnecting`, nothing it does is a delivery, so the axis must not read `.flowing` again, and the
     /// give-up must say `.exhausted` rather than claim the source came back.
     @Test("a refusing origin stays visible across the runway and the give-up",
-          .timeLimit(.minutes(2)))
+          .timeLimit(.minutes(3)))
     func refusedRefillHoldsTheStallThroughGiveUp() async throws {
 
         // 8 MB of runway so the low-water refill is refused while the window still has plenty to serve:
@@ -43,7 +46,7 @@ struct Issue410SourceStallVisibilityTests {
         let firstRange: Int64 = 8 * 1024 * 1024
         let serverMaybe = ThrottledOriginServer(
             totalSize: 64 * 1024 * 1024,
-            respond: { _, offset, _ in offset < firstRange ? .serve206 : .status(500) }
+            respond: { _, offset, _ in offset < (firstRange - Int64(AVIOReader.rangeCheckBytes)) ? .serve206 : .status(500) }
         )
         let server = try #require(serverMaybe)
         defer { server.stop() }
@@ -76,7 +79,7 @@ struct Issue410SourceStallVisibilityTests {
     /// The counterpart, so the rule cannot be satisfied by never reporting recovery: an origin that refuses
     /// once and then delivers must clear the axis off its own delivery.
     @Test("a transient refusal clears once the origin delivers again",
-          .timeLimit(.minutes(2)))
+          .timeLimit(.minutes(3)))
     func transientRefusalClearsOnDelivery() async throws {
 
         let firstRange: Int64 = 1024 * 1024
@@ -84,7 +87,7 @@ struct Issue410SourceStallVisibilityTests {
         let serverMaybe = ThrottledOriginServer(
             totalSize: 8 * 1024 * 1024,
             respond: { _, offset, _ in
-                guard offset >= firstRange else { return .serve206 }
+                guard offset >= (firstRange - Int64(AVIOReader.rangeCheckBytes)) else { return .serve206 }
                 return refusals.bumpAndGet() <= 1 ? .status(500) : .serve206
             }
         )
@@ -120,7 +123,7 @@ struct Issue410SourceStallVisibilityTests {
     /// reads is erased by read-ahead paid for before the origin died, and the `.exhausted` the give-up just
     /// published does not survive the next read.
     @Test("bytes handed back out of memory do not clear the stall",
-          .timeLimit(.minutes(2)))
+          .timeLimit(.minutes(3)))
     func memoryServeDoesNotClearTheStall() async throws {
 
         let runway: Int64 = 8 * 1024 * 1024

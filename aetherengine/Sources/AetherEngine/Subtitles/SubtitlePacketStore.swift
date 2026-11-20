@@ -148,6 +148,13 @@ final class SubtitlePacketStore: @unchecked Sendable {
         coverage.noteAnchor(writer, at: seconds)
     }
 
+    /// #941: that reader repositioned and cannot say where it landed. See
+    /// `SubtitleHarvestCoverage.noteLostPosition`.
+    func noteHarvestPositionLost(_ writer: Writer) {
+        lock.lock(); defer { lock.unlock() }
+        coverage.noteLostPosition(writer)
+    }
+
     /// #416: that reader's current run has read one step further, through `seconds`.
     func noteHarvestProgress(_ writer: Writer, through seconds: Double) {
         lock.lock(); defer { lock.unlock() }
@@ -173,10 +180,12 @@ final class SubtitlePacketStore: @unchecked Sendable {
     }
 
     /// #941: `hasReadSpan` as a snapshot, for a drain tick that asks once per stored pair and
-    /// should not take the lock for each. Same answer on a silent ledger: everything reads as read.
-    func harvestReadCheck() -> @Sendable (Double, Double) -> Bool {
+    /// should not take the lock for each. #1021: nil on a silent ledger rather than "everything
+    /// read", because the drain treats a spoken ledger as the whole answer and falls back to
+    /// harvest order only when there is none.
+    func harvestReadCheck() -> (@Sendable (Double, Double) -> Bool)? {
         lock.lock(); defer { lock.unlock() }
-        guard !coverage.isEmpty else { return { _, _ in true } }
+        guard !coverage.isEmpty else { return nil }
         let spans = coverage.sortedSpans()
         return { SubtitleHarvestCoverage.covers(spans, from: $0, through: $1) }
     }
@@ -546,6 +555,33 @@ final class SubtitlePacketStore: @unchecked Sendable {
                 payloadHashesByRun[idx] = nil
             }
         }
+    }
+
+    /// AE#1095: a session that adopts a parked session's segments starts its pump past them, so no
+    /// reader of its own ever reads that span. It takes over what the parked session's readers
+    /// harvested there, coverage included, before any reader of its own starts. Display sets still in
+    /// assembly stay behind: the writer that began them is gone and could never finish them.
+    func adoptContents(of other: SubtitlePacketStore) {
+        guard other !== self else { return }
+        other.lock.lock()
+        let entries = other.entriesByStream
+        let bytes = other.bytesByStream
+        let hashes = other.payloadHashesByRun
+        let touches = other.lastTouchByStream
+        let touchCount = other.touchCounter
+        let appendCount = other.appendCounter
+        let harvested = other.coverage
+        other.lock.unlock()
+        lock.lock(); defer { lock.unlock() }
+        entriesByStream = entries
+        bytesByStream = bytes
+        pendingSetByStream.removeAll()
+        payloadHashesByRun = hashes
+        lastTouchByStream = touches
+        touchCounter = touchCount
+        appendCounter = appendCount
+        coverage = harvested
+        totalBytes = bytes.values.reduce(0, +)
     }
 
     func clear() {

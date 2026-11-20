@@ -57,6 +57,7 @@ Anything the app layer should already handle or doesn't need:
 ./build.sh static   # static variant, for apps that can meet LGPL 6(a) themselves
 ./build.sh package  # repackage frameworks without recompiling
 ./build.sh clean    # wipe everything
+./build.sh --without-dtsx-heights   # leave out the DTS:X height patch, see below
 ```
 
 Needs Xcode 16+ and roughly 10-30 minutes depending on your machine. All sources (FFmpeg, dav1d, zimg, libzvbi) clone on first run.
@@ -68,14 +69,14 @@ Output lands in `Sources/` as xcframeworks, ready to consume via Swift Package M
 ```swift
 // Package.swift
 dependencies: [
-    .package(url: "https://github.com/superuser404notfound/FFmpegBuild", from: "3.11.1")
+    .package(url: "https://github.com/superuser404notfound/FFmpegBuild", from: "3.16.1")
 ]
 
 // Target:
 .product(name: "AetherFFmpegBuild", package: "FFmpegBuild")
 ```
 
-Pin `branch: "main"` instead of a version if you want to track the latest rebuilds (that is how [AetherEngine](https://github.com/superuser404notfound/AetherEngine) consumes it).
+Pin `branch: "main"` instead of a version if you want to track the latest rebuilds. [AetherEngine](https://github.com/superuser404notfound/AetherEngine) pins a release with `.upToNextMinor(from:)`.
 
 Then import the modules you need: `AetherLibavformat`, `AetherLibavcodec`, `AetherLibavutil`, `AetherLibswresample`, `AetherLibswscale`, `AetherLibavfilter`, `AetherLibdav1d`. (`AetherLibzimg` is a link-only backend for `zscale`, and `AetherLibzvbi` a link-only backend for the teletext decoder; you don't import either directly.) The umbrella `AetherFFmpegBuild` product links all of them plus the system frameworks (AudioToolbox, CoreMedia, CoreVideo, VideoToolbox) in one shot.
 
@@ -101,7 +102,7 @@ What the rename does **not** change is the C symbols: `_avcodec_open2` is still 
 
 - **Video (hardware via VideoToolbox)**: H.264, HEVC up to Main10 (HDR10 / DV Profile 8)
 - **Video (software)**: AV1 (dav1d), VP9, VP8, MPEG-2, MPEG-4, VC-1, QuickTime RLE (qtrle), and the legacy Microsoft tail: MS-MPEG4 v1 / v2 / v3 (DivX 3.x in pre-2005 AVI rips), WMV1 / WMV2, WMV3 (WMV9). A native `.wmv` / `.asf` plays whole: the `asf` demuxer and every WMA decoder ship with it, because a decoder left out is a file with silent audio (the consumer's bridge finds no decoder for the id and the session falls to video-only). The Flash tail is here for the same reason: FLV1 (Sorenson Spark) and On2 VP6 / VP6F / VP6A with the era's audio, so a legacy `.flv` plays whole where before only H.264-in-FLV did. Flash Screen Video stays out, it needs zlib
-- **Audio**: AAC, AC3, EAC3 (incl. JOC detection for Atmos), FLAC, MP2, MP3, Opus, Vorbis, TrueHD, MLP, DTS, ALAC, PCM (incl. Blu-ray LPCM via `pcm_bluray`, G.711 A-law / mu-law, big-endian and unsigned 8-bit), WMA Standard / Pro / Lossless / Voice, Nellymoser Asao, ADPCM-SWF, Speex
+- **Audio**: AAC, AC3, EAC3 (incl. JOC detection for Atmos), FLAC, MP2, MP3, Opus, Vorbis, TrueHD, MLP, DTS, ALAC, PCM (8, 16, 24 and 32-bit integer and 32 / 64-bit float, little and big endian, unsigned 8-bit, G.711 A-law / mu-law, Blu-ray LPCM via `pcm_bluray`, DVD LPCM), MP1, WMA Standard / Pro / Lossless / Voice, Nellymoser Asao, ADPCM-SWF, Speex
 - **Subtitles**: SRT, ASS, SSA, WebVTT, PGS, DVB subtitle, DVB teletext (via libzvbi), DVD
 
 HDR metadata (BT.2020, SMPTE ST 2084 / PQ, HLG, DV RPU) is preserved end-to-end so the decode pipeline can tag frames correctly.
@@ -137,7 +138,7 @@ The frameworks that call one of Apple's required-reason APIs carry their own `Pr
 
 ## Local FFmpeg patches
 
-`build.sh` applies eleven patches to the FFmpeg source after checkout (each documented in place; the two largest live in `patches/`):
+`build.sh` applies fourteen patches to the FFmpeg source after checkout (each documented in place; the larger ones live in `patches/`):
 
 - **`patch_ffmpeg`**: balances autoreleased Metal objects in `vf_yadif_videotoolbox.m` (upstream over-release crashes host apps whose GCD queues pop their last-resort autorelease pool at session teardown).
 - **`patch_ffmpeg_pgssub`**: `pgssubdec.c` emits an empty (clearing) subtitle instead of dropping a display set whose palette is missing, outside `AV_EF_EXPLODE`. PGS carries no end time, a cue is closed by the start of its successor, so dropping a damaged set also dropped the successor that closes the previous cue, and the predecessor overstayed its authored end until the next intact set arrived (AetherEngine issue 142). The pts is already set and no rect is allocated at that point, so this is the same clearing form the `object_count == 0` path returns. The first version of this patch instead kept the palette/object cache across an Epoch-Continue PCS; that was withdrawn because retained objects occupy the fixed `MAX_EPOCH_OBJECTS` slots and made a conformant connection set fail with "Too many objects in epoch". Proposed upstream as FFmpeg PR 23851.
@@ -147,9 +148,47 @@ The frameworks that call one of Apple's required-reason APIs carry their own `Pr
 - **`patch_ffmpeg_mpegts_mpeg1_probe`**: `mpegts.c` probes the payload of a PID labelled 0x03 (MPEG-1 audio), as it already does for 0x04 (MPEG-2 audio) and 0x0f (AAC). Upstream takes 0x03 at its word, so a restreamer that labels a DTS PID that way opens it as mp3, every packet fails with "Header missing", and the track never produces a frame (AetherEngine issue 641). A genuine MP2 or MP3 PID settles on its first PES packet, and a probe that finds nothing better keeps the PMT's codec. Proposed upstream as FFmpeg PR 24697. The same issue is why the raw `dts`, `truehd` and `loas` demuxers are enabled: the MPEG-TS content probe confirms a codec by running the raw demuxers' probes over the payload, so a codec without its raw demuxer in the build could never be confirmed, and the lenient mp3 probe named the track instead, whatever the label.
 - **`patch_ffmpeg_eac3_dec3`**: `movenc.c` describes a Dolby Digital Plus track whose height channels and Atmos objects live in a dependent substream, the Blu-ray layout of an AC-3 core followed by an E-AC-3 dependent frame. Upstream builds the `dec3` box from the first access unit and gets two of its fields wrong there: `chan_loc` was taken from `chanmap` with a plain shift and a five-bit mask, although `chanmap` is read MSB-first and `chan_loc` spans nine bits, so 5.1.2 came out as no extra channels at all; and `complexity_index_type_a`, the ETSI TS 103 420 JOC extension, was read from the independent substream only, so the box lost it. tvOS then decodes the 5.1 bed and an Atmos receiver reports multichannel PCM (AetherEngine issue 728). The first half is upstream as `f10fdd6310` on master and is skipped once the pinned tag carries it; the second half is proposed upstream as FFmpeg PR 24963.
 - **`patch_ffmpeg_movenc_fragment_end`**: `movenc.c` no longer aborts the process when a fragment is flushed with a packet still waiting in the interleaver that lies behind the samples already written for its track. `mov_flush_fragment` takes that packet's dts as the track end, but `check_pkt` may have moved the written samples past it (the first sample of a fragment is placed at the previous fragment's declared end, and later ones still below it are clamped), so the end fell before the last sample and `get_cluster_duration` hit `av_assert0(next_dts >= 0)`. Such a packet says nothing about where the track ends and is now skipped. Reached through AetherEngine's HLS segment muxer, which uses `frag_custom` and flushes with `av_write_frame(NULL)` (StreamX crash report, 2026-10-10). Proposed upstream as FFmpeg PR 25021.
-- **`patch_ffmpeg_dca_x_heights`** (`patches/dca-xll-x-heights.patch`): the `dca` decoder decodes the height channels of DTS:X's standard presentation. They travel in a regular XLL channel set at the end of every lossless frame, behind the syncword upstream already recognises (it sets the "DTS-HD MA + DTS:X" profile) and then skips; the encoder also folds each of them at -3 dB into the 7.1 bed speaker under it. With the new decoder option `x_heights` (off by default) the decoder reads that channel set with FFmpeg's own XLL code, outputs 7.1.4 and removes the fold from the bed at output resolution. Without the option, and for every stream without the extension, the output is byte-identical to upstream (checked against FATE's DTS suite with and without downmix). A frame whose extension does not decode keeps 7.1.4 with silent heights. The alternate presentations, which carry objects, are left at their 7.1. This replaces LibDTSX in AetherEngine (#798), whose port of this decoder combined with Apache-2.0 code came out LGPL-3.0-or-later.
+- **`patch_ffmpeg_dca_x_heights`** (`patches/dca-xll-x-heights.patch`): the `dca` decoder decodes the height channels of DTS:X's standard presentation. They travel in a regular XLL channel set at the end of every lossless frame, behind the syncword upstream already recognises (it sets the "DTS-HD MA + DTS:X" profile) and then skips; the encoder also folds each of them at -3 dB into the 7.1 bed speaker under it. With the new decoder option `x_heights` (off by default) the decoder reads that channel set with FFmpeg's own XLL code and outputs 7.1.4: the bed exactly as coded, the heights still folded into it, next to the four height channels. Nothing is subtracted from the bed; separating the heights from it is left to the player (AetherEngine builds its layout from that bed, see its `BedRegression`). Without the option, and for every stream without the extension, the output is byte-identical to upstream (checked against FATE's DTS suite with and without downmix). A frame whose extension does not decode keeps 7.1.4 with silent heights. The alternate presentations (FFmpeg labels some "DTS:X IMAX") carry the same four fixed heights after one to five object channels; the same option locates that height channel set behind their CRC-protected prefix and control blocks and outputs it the same way, while the object channels are never decoded and stay in the bed where the encoder folded them. An alternate stream without heights keeps its 7.1. This replaces LibDTSX in AetherEngine (#798), whose port of this decoder combined with Apache-2.0 code came out LGPL-3.0-or-later.
 - **`patch_ffmpeg_av1_delayed_rap`** (`patches/av1-delayed-rap.patch`): an AV1 Temporal Unit that carries a Sequence Header and opens with a hidden Key Frame (`show_frame = 0`) refreshing all eight reference slots is a keyframe. Encodes built on forward key frames open every GOP that way, and decoding from such a unit is correct right away, but upstream treats it as an inter frame in two places: `av1_parser` reports only a shown Key Frame, and for Matroska video that verdict replaces the block's flag; and muxers (mkvmerge, lavf) leave the SimpleBlock flag off, so `matroskadec` never builds an index and every seek fails, including the one back to the start after probing. The reporting file reached AetherEngine without a single keyframe and never started (AetherEngine issue 931). The patch adds `ff_av1_is_random_access_point()` to `libavformat/av1.c`, which reads the first frame header up to `refresh_frame_flags`; `matroskadec` flags an unflagged AV1 SimpleBlock that passes it and `av1_parser` reports the same case. A hidden Key Frame with a partial refresh, which libaom writes for `--enable-fwd-kf`, is left alone, since frames after it still reference the previous shown Key Frame. Proposed upstream as FFmpeg PR 25607.
+- **`patch_ffmpeg_matroska_skip_attachments`** (`patches/matroska-skip-attachments.patch`): the matroska demuxer gains an AVClass with the option `skip_attachments` (off by default). Matroska attachments, in practice the fonts of ASS subtitles, are read in full while the file opens, before the first packet: tens of megabytes on anime releases, about 11 s of a WAN open in the report (AetherEngine issue 956). With the option the open passes over the Attachments element, both where mkvmerge and lavf write it (before the first Cluster) and behind the Clusters, where mkvpropedit appends it and only the SeekHead points at it. No attachment streams are created, Tags that target one are dropped without a warning, and tracks, their indices and packets are unchanged. Without the option the demuxer is unchanged.
+- **`patch_ffmpeg_matroska_byte_seek_done`** (`patches/matroska-byte-seek-done.patch`): the matroska demuxer forgets an end of stream after a byte seek. It latches end of stream in its private `done` flag, and only its own `read_seek` cleared it, but `AVSEEK_FLAG_BYTE` and the generic fallback a failed index seek takes never reach `read_seek`. So once a file had been read to its end, or a read had failed, every later read returned EOF wherever the seek landed (AetherEngine issue 944: a subtitle side reader read EOF at second 0 of an 888 s file). `read_packet` now honours `io_repositioned` like oggdec and av1dec: it resets the parsing state at the new position, drops queued packets and a pending keyframe skip, and clears the flag.
+- **`patch_ffmpeg_mpegts_dovi_descriptor`** (`patches/mpegts-dovi-descriptor.patch`): the `mpegts` muxer writes the Dolby Vision descriptors. The demuxer reads the DOVI video stream descriptor (`0xb0`) into the stream's `AV_PKT_DATA_DOVI_CONF` record, but the muxer never wrote it, so a Dolby Vision stream copied into a transport stream kept every RPU and lost its record. AetherEngine's live recordings are such a copy: played back, Profile 8.1 came out as HDR10, Profile 8.4 as HLG and Profile 5 as HDR10 with the wrong colours.
+
+  An H.264 or HEVC stream whose record carries both its base layer and its RPU now gets the `0xb0` descriptor from that record (version, profile, level, the present flags, base-layer compatibility id, metadata compression). With compatibility id 0 (Profile 5) it also gets the `DOVI` registration descriptor, as Dolby's TS spec asks, placed before the `HEVC` registration so the stream keeps `HEVC` as its codec tag. Profile 5 stays on stream_type `0x24` instead of the spec's `0x06`, because players that do not know Dolby Vision cannot find the video under `0x06`.
+
+  Left as they were: a stream without a base layer (its descriptor needs the base layer's PID, which the record does not carry), a base layer whose RPU was stripped, and streams without a record. The patch is the muxer half of upstream [FFmpeg PR 26097](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/26097) and goes once that lands in the pinned tag.
+- **`patch_ffmpeg_mov_lazy_frag_index`** (`patches/mov-lazy-frag-index.patch`): the mov demuxer takes `lazy_frag_index` (off by default). A fragmented MP4 without a complete `sidx` is indexed while it opens: on a seekable input the header reads every top-level `moof` to the end of the file, one seek per fragment, before the first packet (a 4 minute file of 96 fragments on a WAN address: 12 s and about 90 requests to open). With the option the header stops behind the first `moof`, and a seek finds its fragment on demand: it estimates a byte offset, resynchronises on the next `moof`, checks that it is one (box sizes, track ids, a `tfdt` per track, sample data inside the `mdat`, the box chain behind it), and bisects on `tfdt`. An `mfra` is used for its `moof` offsets only, each checked against the `moof` it points at. The streams get their durations at open from the last fragment of each track. Files whose fragments carry no `tfdt`, or whose end cannot be found (a truncated file), are read as before. Checked packet for packet against the unpatched demuxer on 18 fragmented layouts; the same file opens in 0.9 s and 4 requests. Differences that remain with the option on: the per-stream bit rate is not set at open, a file with a separate `moof` per track delivers its packets in file order rather than interleaved across fragments, and a forward seek past a stream's last sync sample leaves the streams that follow at their end (the full index leaves them where they were). Without the option, and on files that are not fragmented, the demuxer is unchanged. `LazyFragIndexTests` checks that the option is there and that seeks land where the full index lands.
 - **`patch_ffmpeg_matroska_tts`**: `matroskadec.c` logs a warning when a Matroska track carries a `TrackTimestampScale` other than 1.0. Timestamp behavior stays exactly as upstream implements it, which is what RFC 9559 specifies (block timestamps and BlockDuration are Track Ticks). The element is deprecated (maxver 3) and many readers ignore it, so a file carrying it may have been authored against such readers and mistime silently; the warning surfaces that condition (AetherEngine issue 145). Until 2.1.x this patch clamped TTS to 1.0; the clamp rested on a wrong reading of the RFC and was dropped after upstream review (FFmpeg PR 23852).
+
+## Building without the DTS:X height patch
+
+`./build.sh --without-dtsx-heights` builds everything as usual but leaves out `patch_ffmpeg_dca_x_heights`. The `dca` decoder is then upstream's. DTS core, DTS-HD Master Audio and the 7.1 bed of DTS:X decode exactly as in stock FFmpeg n8.1.3, and the decoder has no `x_heights` or `x_presentation` option. The flag combines with `static`.
+
+This is for apps that build AetherEngine without its `DTSXObjectAudio` trait (off by default) and want the height decoder out of the shipped binary too, not just unused (FFmpegBuild#12). The released xcframeworks always carry the patch, so this variant is one you build yourself.
+
+- A source tree patched by an earlier build gets the four files the patch touches put back to the tag, so you can switch in either direction without `clean`.
+- `BUILD-INFO.txt` then says `DTS:X heights patch left out (--without-dtsx-heights)`, and `DTSXHeightsOptionTests` checks that the option is absent instead of present.
+- AetherEngine with the trait off never asks for the option. With the trait on against such a build, it logs `no x_heights option` and plays DTS:X as its 7.1 bed.
+
+To ship it, the app has to resolve your build instead of this repo, for AetherEngine too:
+
+1. Fork this repo, run `./build.sh --without-dtsx-heights` and commit `Sources/` and `BUILD-INFO.txt`.
+2. Tag that commit with the version you built from. AetherEngine requires FFmpegBuild within a version range, so the tag has to fall inside it. Your fork already carries that tag pointing at the patched binaries; delete it there first.
+3. Point SwiftPM at the fork with a mirror. For a package, run `swift package config set-mirror --original https://github.com/superuser404notfound/FFmpegBuild --mirror https://github.com/<you>/FFmpegBuild`. For an Xcode project, put the same mirror into `YourApp.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/configuration/mirrors.json` (and into the `.xcworkspace` if you open one), then run File > Packages > Resolve Package Versions:
+
+```json
+{
+  "object" : [
+    {
+      "mirror" : "https://github.com/<you>/FFmpegBuild",
+      "original" : "https://github.com/superuser404notfound/FFmpegBuild"
+    }
+  ],
+  "version" : 1
+}
+```
+
+Your fork is then the source of the build you ship, which is what step 3 under [Shipping in an App Store app](#shipping-in-an-app-store-app) links to.
 
 ## Build record
 
@@ -157,6 +196,7 @@ The binaries are built on a local Mac, not in CI, so there is no attestation. In
 
 - the upstream tag and resolved commit of FFmpeg, dav1d, zimg and libzvbi, and a SHA-256 over the changes the patch functions made to each tree (tracked edits plus added files such as the libzvbi stub),
 - the SHA-256 of `build.sh` and of every file in `patches/`,
+- whether the DTS:X height patch was applied or left out (`--without-dtsx-heights`; a record without that line applied it),
 - macOS, Xcode, clang and SDK versions, and the versions of meson, ninja, autotools and pkg-config,
 - FFmpeg's configure line for every slice, as recorded in its `config.h`,
 - the SHA-256 of every shipped binary.

@@ -8,6 +8,7 @@
 #   ./build.sh static   # Build static variant (not App Store friendly for closed-source apps)
 #   ./build.sh package  # Repackage frameworks from existing build products
 #   ./build.sh clean    # Remove all build artifacts
+#   ./build.sh --without-dtsx-heights   # Leave out patches/dca-xll-x-heights.patch (see README)
 #
 set -eo pipefail  # pipefail so `... | tail -N` doesn't swallow configure/make errors
 
@@ -41,12 +42,14 @@ ZVBI_SRC="${BUILD_DIR}/zvbi-src"
 # available for people who build themselves and can meet LGPL 6(a) instead.
 MODE="build"
 LINKAGE="dynamic"
+DTSX_HEIGHTS="applied"
 for ARG in "$@"; do
     case "${ARG}" in
         clean)   MODE="clean" ;;
         package) MODE="package" ;;
         static)  LINKAGE="static" ;;
         dynamic) LINKAGE="dynamic" ;;
+        --without-dtsx-heights) DTSX_HEIGHTS="left out (--without-dtsx-heights)" ;;
         *) echo "Unknown argument: ${ARG}"; exit 1 ;;
     esac
 done
@@ -774,6 +777,16 @@ COMMON_FLAGS=(
     --enable-decoder=mp3float --enable-decoder=opus --enable-decoder=vorbis
     --enable-decoder=truehd --enable-decoder=mlp --enable-decoder=dca --enable-decoder=alac
     --enable-decoder=pcm_s16le --enable-decoder=pcm_s24le --enable-decoder=pcm_f32le
+    # The other integer and float PCM shapes the enabled demuxers can hand over: 24-bit
+    # big-endian is what camera MOVs record as `in24`, 32-bit integer comes in WAV
+    # (s32le) and MOV (`in32`, s32be), big-endian float in MOV (`fl32`, `fl64`), 64-bit
+    # little-endian float in WAV and Matroska, and signed 8-bit in MOV (`twos` at 8 bits).
+    # Without them such a track plays SILENT, the same failure the WMA note above
+    # describes. All of them live in the one pcm.c, so the cost is a few table entries,
+    # not code.
+    --enable-decoder=pcm_s24be --enable-decoder=pcm_s32le --enable-decoder=pcm_s32be
+    --enable-decoder=pcm_f32be --enable-decoder=pcm_f64le --enable-decoder=pcm_f64be
+    --enable-decoder=pcm_s8
     # Flash Video audio, the whole tail, all-or-nothing for the same reason the WMA
     # family above is: a decoder missing here is a file that plays as a silent film
     # rather than failing honestly, because the bridge has nothing to open. Nellymoser Asao and ADPCM-SWF are what the
@@ -793,6 +806,9 @@ COMMON_FLAGS=(
     # still carry MP2. Not legal in fMP4 so AetherEngine's AudioBridge
     # decodes to PCM and re-encodes as FLAC. ~5 KB binary cost.
     --enable-decoder=mp2
+    # MP1 (MPEG-1 Layer I), the oldest member of the same family, for the rare file that
+    # still carries it. It shares mpegaudiodec with mp2, its patents expired long ago.
+    --enable-decoder=mp1
     --enable-decoder=ass --enable-decoder=srt --enable-decoder=subrip
     --enable-decoder=movtext --enable-decoder=dvdsub --enable-decoder=dvbsub
     --enable-decoder=pgssub --enable-decoder=webvtt
@@ -1312,6 +1328,7 @@ record_build_inputs() {
         echo "Built      $(date -u +%Y-%m-%dT%H:%M:%SZ), linkage ${LINKAGE}"
         echo "Repo HEAD  $(git -C "${SCRIPT_DIR}" rev-parse HEAD)${DIRTY}"
         echo "build.sh   sha256 $(shasum -a 256 "${SCRIPT_DIR}/build.sh" | cut -d' ' -f1)"
+        echo "DTS:X heights patch ${DTSX_HEIGHTS}"
         for P in "${SCRIPT_DIR}"/patches/*(N); do
             echo "patches/${P:t}  sha256 $(shasum -a 256 "${P}" | cut -d' ' -f1)"
         done
@@ -1512,16 +1529,33 @@ patch_ffmpeg_dca_x_heights() {
     # DTS:X heights without LibDTSX (AetherEngine #798). The standard presentation of DTS:X
     # carries its four height channels in a regular XLL channel set at the end of every XLL
     # frame, which upstream recognises (it sets the "DTS-HD MA + DTS:X" profile) but skips.
-    # The patch decodes that set with the existing channel set code, adds a decoder option
-    # "x_heights" (off by default) that outputs 7.1.4, and removes the -3 dB fold of each
-    # height from the bed speaker under it. Without the option the output is unchanged
-    # byte for byte. It lives in patches/ rather than inline: at this size a perl
+    # The patch decodes that set with the existing channel set code and adds a decoder option
+    # "x_heights" (off by default) that outputs 7.1.4: the bed as coded, with the heights
+    # still folded into it at -3 dB, next to the four heights. Nothing is taken out of the
+    # bed. Without the option the output is unchanged byte for byte. The same option decodes
+    # the four fixed heights of the alternate presentations (FFmpeg's "DTS:X IMAX" among
+    # them) and leaves their object channels in the bed. It lives in patches/ rather than inline: at this size a perl
     # substitution would be unreadable. The patch header explains the format.
     local P="${SCRIPT_DIR}/patches/dca-xll-x-heights.patch"
-    if grep -q '"x_heights"' "${FFMPEG_SRC}/libavcodec/dcadec.c"; then
+    local -a files=(libavcodec/dca_xll.c libavcodec/dca_xll.h libavcodec/dcadec.c libavcodec/dcadec.h)
+    if [[ "${DTSX_HEIGHTS}" != "applied" ]]; then
+        # FFmpegBuild#12: for apps that ship without AetherEngine's DTSXObjectAudio trait and
+        # want the implementation out of the binary too. The tree may still carry the patch
+        # from an earlier build, so put the four files back to the tag.
+        if grep -q '"x_heights"' "${FFMPEG_SRC}/libavcodec/dcadec.c"; then
+            git -C "${FFMPEG_SRC}" checkout -- "${files[@]}"
+        fi
+        echo "→ Leaving out the DTS:X height patch (--without-dtsx-heights)"
         return
     fi
-    echo "→ Patching FFmpeg: decode the DTS:X standard presentation's height channels (AetherEngine #798)"
+    if grep -q '"x_presentation"' "${FFMPEG_SRC}/libavcodec/dcadec.c"; then
+        return
+    fi
+    # A source tree patched by an earlier version of this patch: start over
+    if grep -q '"x_heights"' "${FFMPEG_SRC}/libavcodec/dcadec.c"; then
+        git -C "${FFMPEG_SRC}" checkout -- "${files[@]}"
+    fi
+    echo "→ Patching FFmpeg: decode the DTS:X height channels, standard and alternate presentations (AetherEngine #798)"
     git -C "${FFMPEG_SRC}" apply "${P}" || {
         echo "ERROR: DTS:X height patch did not apply (upstream source changed?)"
         exit 1
@@ -1551,6 +1585,82 @@ patch_ffmpeg_av1_delayed_rap() {
     }
 }
 
+patch_ffmpeg_matroska_skip_attachments() {
+    # AetherEngine #956. Matroska attachments (in practice the fonts of ASS subtitles, tens of
+    # megabytes on anime releases) are read in full while the file opens, before the first
+    # packet. The patch adds a matroska demuxer option "skip_attachments" (off by default)
+    # that passes over the Attachments element and the SeekHead entry pointing at it, for a
+    # host that does not use the fonts. Without the option the demuxer is unchanged.
+    local P="${SCRIPT_DIR}/patches/matroska-skip-attachments.patch"
+    if grep -q '"skip_attachments"' "${FFMPEG_SRC}/libavformat/matroskadec.c"; then
+        return
+    fi
+    echo "→ Patching FFmpeg: matroska skip_attachments option (AetherEngine #956)"
+    git -C "${FFMPEG_SRC}" apply "${P}" || {
+        echo "ERROR: matroska skip_attachments patch did not apply (upstream source changed?)"
+        exit 1
+    }
+}
+
+patch_ffmpeg_matroska_byte_seek_done() {
+    # AetherEngine #944. matroskadec latches end of stream in its private "done" flag and only
+    # its own read_seek clears it, so after a byte seek (or the generic fallback a failed index
+    # seek takes) every read returned EOF once the file had been read to its end or a read had
+    # failed. The patch makes read_packet honour io_repositioned, like oggdec and av1dec.
+    local P="${SCRIPT_DIR}/patches/matroska-byte-seek-done.patch"
+    if grep -q "end of stream reached before it" "${FFMPEG_SRC}/libavformat/matroskadec.c"; then
+        return
+    fi
+    echo "→ Patching FFmpeg: matroska forgets end of stream after a byte seek (AetherEngine #944)"
+    git -C "${FFMPEG_SRC}" apply "${P}" || {
+        echo "ERROR: matroska byte seek patch did not apply (upstream source changed?)"
+        exit 1
+    }
+}
+
+patch_ffmpeg_mpegts_dovi_descriptor() {
+    # AetherEngine live recordings. mpegts.c reads the DOVI video stream descriptor (0xb0)
+    # into AV_PKT_DATA_DOVI_CONF, but mpegtsenc.c never writes it, so a Dolby Vision stream
+    # copied into a transport stream keeps its RPUs and loses its record. A player that
+    # recognises Dolby Vision from the record then plays the copy as HDR10 (Profile 8.1),
+    # HLG (Profile 8.4) or HDR10 with the wrong colours (Profile 5). The patch is the muxer
+    # half of FFmpeg PR 26097: an H.264 or HEVC stream whose record carries its base layer
+    # and its RPU gets the 0xb0 descriptor, and with compatibility ID 0 (Profile 5) also the
+    # 'DOVI' registration, written before the codec's own so codec_tag stays HEVC. Drop it
+    # once the upstream commit is in the pinned tag.
+    local P="${SCRIPT_DIR}/patches/mpegts-dovi-descriptor.patch"
+    if grep -q "put_dovi_descriptors" "${FFMPEG_SRC}/libavformat/mpegtsenc.c"; then
+        return
+    fi
+    echo "→ Patching FFmpeg: the mpegts muxer writes the Dolby Vision descriptors"
+    git -C "${FFMPEG_SRC}" apply "${P}" || {
+        echo "ERROR: mpegts Dolby Vision descriptor patch did not apply (upstream source changed?)"
+        exit 1
+    }
+}
+
+patch_ffmpeg_mov_lazy_frag_index() {
+    # A fragmented MP4 without a complete sidx is indexed by reading every top-level moof
+    # before the header returns, one seek each: over a network that is a request per
+    # fragment before the first packet (a 4 minute, 96 fragment file on a WAN address:
+    # about 12 s and 90 requests to open). The patch adds a mov demuxer option
+    # "lazy_frag_index" (off by default) that stops the header behind the first moof and
+    # lets a seek find its fragment on demand: byte interpolation, resynchronisation on
+    # the next moof, tfdt bisection, with the mfra as a hint when the file has one. A seek
+    # lands where it lands with the full index. Files whose fragments carry no tfdt, or
+    # whose end cannot be found, are read as before. Without the option the demuxer is
+    # unchanged.
+    local P="${SCRIPT_DIR}/patches/mov-lazy-frag-index.patch"
+    if grep -q '"lazy_frag_index"' "${FFMPEG_SRC}/libavformat/mov.c"; then
+        return
+    fi
+    echo "→ Patching FFmpeg: mov lazy_frag_index option"
+    git -C "${FFMPEG_SRC}" apply "${P}" || {
+        echo "ERROR: mov lazy fragment index patch did not apply (upstream source changed?)"
+        exit 1
+    }
+}
+
 echo "╔══════════════════════════════════════╗"
 echo "║  FFmpegBuild: FFmpeg + dav1d (AV1)  ║"
 echo "║  VideoToolbox HW + Metal ready      ║"
@@ -1569,6 +1679,10 @@ patch_ffmpeg_eac3_dec3
 patch_ffmpeg_movenc_fragment_end
 patch_ffmpeg_dca_x_heights
 patch_ffmpeg_av1_delayed_rap
+patch_ffmpeg_matroska_skip_attachments
+patch_ffmpeg_matroska_byte_seek_done
+patch_ffmpeg_mpegts_dovi_descriptor
+patch_ffmpeg_mov_lazy_frag_index
 fetch_dav1d
 fetch_zimg
 fetch_zvbi

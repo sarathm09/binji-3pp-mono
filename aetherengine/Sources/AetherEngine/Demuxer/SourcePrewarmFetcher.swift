@@ -179,7 +179,7 @@ enum RangeFetch {
         guard let ticket = OriginRequestBudget.shared.tryAcquire(for: url, label: label) else {
             throw PrewarmDecline(reason: "no origin request slot free (#377)")
         }
-        var request = URLRequest(url: url)
+        var request = URLRequest(engineURL: url)
         request.setValue("bytes=\(requestedStart)-\(requestedStart + Int64(requestedLength) - 1)",
                          forHTTPHeaderField: "Range")
         for (k, v) in extraHeaders { request.setValue(v, forHTTPHeaderField: k) }
@@ -272,15 +272,16 @@ private final class RangeFetchDelegate: NSObject, URLSessionDataDelegate, @unche
                     willPerformHTTPRedirection response: HTTPURLResponse,
                     newRequest request: URLRequest,
                     completionHandler: @escaping (URLRequest?) -> Void) {
-        if let from = task.originalRequest?.url, let to = request.url {
-            OriginRequestBudget.shared.noteRedirect(from: from, to: to)
-        }
         // Credential headers do not follow a redirect to another host (#126 cross-origin replay).
-        completionHandler(RedirectHeaderPolicy.redirectRequest(
+        let next = RedirectHeaderPolicy.redirectRequest(
             request,
             originalURL: task.originalRequest?.url,
             originalRange: task.originalRequest?.value(forHTTPHeaderField: "Range"),
-            extraHeaders: extraHeaders))
+            extraHeaders: extraHeaders)
+        if let from = task.originalRequest?.url, let to = next.url {
+            OriginRequestBudget.shared.noteRedirect(from: from, to: to)
+        }
+        completionHandler(next)
     }
 
     func urlSession(_ session: URLSession,
@@ -371,15 +372,8 @@ private final class RangeFetchDelegate: NSObject, URLSessionDataDelegate, @unche
     /// `bytes <start>-<end>/<total>`. A `*` total is a range the origin will not size, which is
     /// exactly the case a prewarm cannot adopt later, so it is rejected here rather than stored.
     static func parseContentRange(_ value: String) -> (start: Int64, end: Int64, total: Int64)? {
-        let trimmed = value.trimmingCharacters(in: .whitespaces)
-        guard trimmed.hasPrefix("bytes ") else { return nil }
-        let body = trimmed.dropFirst("bytes ".count)
-        let parts = body.split(separator: "/", maxSplits: 1, omittingEmptySubsequences: false)
-        guard parts.count == 2, let total = Int64(parts[1]) else { return nil }
-        let span = parts[0].split(separator: "-", maxSplits: 1, omittingEmptySubsequences: false)
-        guard span.count == 2, let start = Int64(span[0]), let end = Int64(span[1]),
-              start >= 0, end >= start, total > end else { return nil }
-        return (start, end, total)
+        guard let range = ContentRange(value), let total = range.total else { return nil }
+        return (range.start, range.end, total)
     }
 }
 

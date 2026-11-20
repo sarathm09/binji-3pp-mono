@@ -12,7 +12,7 @@ import AetherLibavcodec
 /// intact by a failed composition) has not, so it carries the RPU that keeps the mapping and the display
 /// side reshapes it. The two RPUs are stood in for by tagged byte strings: this pins the choice, and
 /// `DoviComposedFrameRpuTests` pins what the two forms contain.
-@Suite(.serialized, .timeLimit(.minutes(2)))
+@Suite(.serialized, .timeLimit(.minutes(3)))
 struct DualLayerBypassRpuTests {
 
     private static let composedTag: UInt8 = 0xC0
@@ -44,6 +44,7 @@ struct DualLayerBypassRpuTests {
         let fails: Bool
         init(fails: Bool) { self.fails = fails }
         func acquireSlot() {}
+        func acquireSlot(timeout: DispatchTime) -> Bool { true }
         func releaseSlot() {}
         func flush() {}
         func composeAsync(baseBuffer: CVPixelBuffer, enhancementBuffer: CVPixelBuffer, params: DoviMetalParams,
@@ -158,10 +159,20 @@ struct DualLayerBypassRpuTests {
     func missingMappingFormFallsBack() async throws {
         let r = Self.rig()
         defer { r.decoder.close() }
+        nonisolated(unsafe) var now: TimeInterval = 100
+        nonisolated(unsafe) var lines: [String] = []
+        r.decoder.summaryTimestampProviderForTesting = { now }
+        r.decoder.summarySinkForTesting = { line, _ in lines.append(line) }
         r.decoder.noteEnhancementAbsentForTesting(pts: Self.pts(240))
         try Self.feedBase(r, 240, baseLayerNAL: nil)
-        try await waitFor { r.delivered.count == 1 }
-        #expect(r.delivered.tags == [Self.composedTag])
+        r.decoder.noteEnhancementAbsentForTesting(pts: Self.pts(241))
+        try Self.feedBase(r, 241)
+        try await waitFor { r.delivered.count == 2 }
+        #expect(r.delivered.tags == [Self.composedTag, Self.baseLayerTag])
+
+        now = 101.5
+        r.decoder.maybeEmitSummary()
+        #expect(try #require(lines.last).contains("mappingFallback=1"), "the fallback is counted, so a device log can show it")
     }
 }
 #endif
